@@ -1,4 +1,15 @@
 {
+  "name": "awsproject",
+  "private": true,
+  "scripts": {
+    "backend": "npm --prefix backend start",
+    "frontend": "npm --prefix jellylemonshake start",
+    "start:backend": "npm --prefix backend start",
+    "start:frontend": "npm --prefix jellylemonshake start",
+    "docker:up": "docker compose up --build",
+    "docker:down": "docker compose down",
+    "deploy:aws": "npm --prefix backend run deploy:aws"
+  },
   "dependencies": {
     "@supabase/supabase-js": "^2.52.1",
     "emoji-picker-react": "^4.13.2",
