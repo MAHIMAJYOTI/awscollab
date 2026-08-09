@@ -5,6 +5,38 @@ import '../styles/components/VideoCall.css';
 // Import socket service directly
 import socketService from '../services/socketService';
 
+const getPeerId = (u) => u?.email || u?.username || u?.id || '';
+
+/** Same identity as chat room — prefer logged-in account username over stale localStorage */
+const getLocalPeerId = (user) => {
+  if (user && !user.isGuest) {
+    if (user.username) return String(user.username);
+    if (user.email) return String(user.email);
+  }
+  try {
+    const chatUser = JSON.parse(localStorage.getItem('chatUser') || '{}');
+    if (chatUser.username) return String(chatUser.username);
+    if (chatUser.email) return String(chatUser.email);
+  } catch {
+    // ignore
+  }
+  return String(getPeerId(user) || '');
+};
+
+const normalizePeerId = (id) => String(id || '').trim().toLowerCase();
+
+const shouldInitiateOffer = (localId, remoteId) =>
+  normalizePeerId(localId) < normalizePeerId(remoteId);
+
+const participantKey = (p) => {
+  if (!p) return '';
+  if (typeof p === 'string') return p;
+  return String(p.socketId || p.username || p.email || p.userId || p.id || '');
+};
+
+const displayName = (participant, fallbackId = '') =>
+  participant?.username || participant?.email || fallbackId || 'Guest';
+
 // Validate socket service
 let socketServiceAvailable = false;
 if (socketService && typeof socketService.on === 'function' && typeof socketService.emit === 'function') {
@@ -97,7 +129,7 @@ const safeSocketService = {
   }
 };
 
-function VideoCall({ roomId, onClose, participants = [] }) {
+function VideoCall({ roomId, onClose, participants = [], onlineUsers = [] }) {
   // Early return if socket service is not available
   if (!socketServiceAvailable) {
     return (
@@ -161,48 +193,131 @@ function VideoCall({ roomId, onClose, participants = [] }) {
   const remoteVideoRefs = useRef([]);
   const peerConnections = useRef({});
   const localStreamRef = useRef(null);
+  const signalingReady = useRef(false);
+  const hasAnnouncedVideo = useRef(false);
+
+  const announceVideoJoin = () => {
+    if (hasAnnouncedVideo.current) return;
+    hasAnnouncedVideo.current = true;
+    const currentUserId = getLocalPeerId(user);
+    safeSocketService.emit('user-joined-video', {
+      roomId,
+      userId: currentUserId,
+      username: currentUserId,
+      email: user?.email || '',
+    });
+  };
+
+  const pendingIceCandidates = useRef({});
+
+  const getMySocketId = () => socketService.getSocketId();
+
+  const isSignalForMe = (data) => {
+    const mySocketId = getMySocketId();
+    if (!mySocketId || data.roomId !== roomId) return false;
+    if (data.from === mySocketId) return false;
+    if (data.to && data.to !== mySocketId) return false;
+    return true;
+  };
+
+  const queueIceCandidate = (peerSocketId, candidate) => {
+    if (!pendingIceCandidates.current[peerSocketId]) {
+      pendingIceCandidates.current[peerSocketId] = [];
+    }
+    pendingIceCandidates.current[peerSocketId].push(candidate);
+  };
+
+  const flushPendingCandidates = async (peerSocketId) => {
+    const pc = peerConnections.current[peerSocketId];
+    const pending = pendingIceCandidates.current[peerSocketId] || [];
+    if (!pc || pending.length === 0) return;
+    for (const candidate of pending) {
+      try {
+        await pc.addIceCandidate(candidate);
+      } catch (err) {
+        console.warn('ICE candidate flush failed:', err?.message);
+      }
+    }
+    pendingIceCandidates.current[peerSocketId] = [];
+  };
+
+  const connectToPeer = (peerSocketId, participant = null) => {
+    const mySocketId = getMySocketId();
+    if (!peerSocketId || !mySocketId || peerSocketId === mySocketId) return;
+    if (peerConnections.current[peerSocketId]) return;
+
+    console.log('📹 Connecting to peer', participant?.username || peerSocketId, peerSocketId);
+
+    setRemoteStreams(prev => {
+      if (prev.some(s => s.id === peerSocketId)) return prev;
+      return [
+        ...prev,
+        {
+          id: peerSocketId,
+          name: displayName(participant, participant?.username || 'Guest'),
+          stream: null,
+          isVideoEnabled: true,
+          isAudioEnabled: true,
+          connectionStatus: 'connecting',
+        },
+      ];
+    });
+
+    const initiateOffer = shouldInitiateOffer(mySocketId, peerSocketId);
+    startWebRTCConnection(peerSocketId, participant, initiateOffer);
+  };
+
+  const safePlay = useCallback((videoEl) => {
+    if (!videoEl) return;
+    const playPromise = videoEl.play();
+    if (playPromise?.catch) {
+      playPromise.catch((err) => {
+        // Harmless when srcObject changes during load (common in dev / strict mode)
+        if (err?.name === 'AbortError') return;
+        if (err?.name === 'NotAllowedError') return;
+        console.warn('Video play failed:', err?.message || err);
+      });
+    }
+  }, []);
+
+  const attachStreamToVideo = useCallback(
+    (videoEl, stream) => {
+      if (!videoEl || !stream) return;
+      if (videoEl.srcObject !== stream) {
+        videoEl.srcObject = stream;
+      }
+      safePlay(videoEl);
+    },
+    [safePlay]
+  );
 
   // Centralized function to set video stream (prevents race conditions)
-  const setVideoStreamSafely = useCallback((stream) => {
-    if (isSettingVideoStream) {
-      return;
-    }
-
-    if (!localVideoRef.current) {
-      return;
-    }
-
-    if (localVideoRef.current.srcObject === stream) {
-      return;
-    }
-
-    setIsSettingVideoStream(true);
-
-    try {
-      // Stop any existing stream
-      if (localVideoRef.current.srcObject) {
-        localVideoRef.current.srcObject.getTracks().forEach(track => track.stop());
+  const setVideoStreamSafely = useCallback(
+    (stream) => {
+      if (!localVideoRef.current || !stream) {
+        return;
       }
-      
-      localVideoRef.current.srcObject = stream;
-      
-      // Ensure video plays
-      const playPromise = localVideoRef.current.play();
-      if (playPromise !== undefined) {
-        playPromise.then(() => {
-          setIsSettingVideoStream(false);
-        }).catch(err => {
-          console.warn('Video play failed:', err);
-          setIsSettingVideoStream(false);
-        });
-      } else {
+
+      if (localVideoRef.current.srcObject === stream) {
+        safePlay(localVideoRef.current);
+        return;
+      }
+
+      if (isSettingVideoStream) {
+        return;
+      }
+
+      setIsSettingVideoStream(true);
+      try {
+        attachStreamToVideo(localVideoRef.current, stream);
+      } catch (error) {
+        console.error('Error setting video stream:', error);
+      } finally {
         setIsSettingVideoStream(false);
       }
-    } catch (error) {
-      console.error('Error setting video stream:', error);
-      setIsSettingVideoStream(false);
-    }
-  }, [isSettingVideoStream]);
+    },
+    [isSettingVideoStream, attachStreamToVideo, safePlay]
+  );
 
   // Manual permission request function
   const requestPermissionsManually = async () => {
@@ -287,24 +402,51 @@ function VideoCall({ roomId, onClose, participants = [] }) {
 
   useEffect(() => {
     try {
-      if (isAuthenticated) {
-        // Socket service is guaranteed to be available at this point
-        console.log('Initializing video call with socket service');
-        
-        // Try to connect socket service
-        safeSocketService.connect();
-        
-        // Add a small delay to ensure DOM is ready
+      if (user && roomId) {
+        // Keep socket identity aligned with logged-in account (not stale chatUser)
+        if (user.username && !user.isGuest) {
+          try {
+            const chatUser = JSON.parse(localStorage.getItem('chatUser') || '{}');
+            if (chatUser.username !== user.username) {
+              localStorage.setItem(
+                'chatUser',
+                JSON.stringify({ ...chatUser, username: user.username, email: user.email })
+              );
+            }
+          } catch {
+            // ignore
+          }
+        }
+
+        if (!safeSocketService.isConnected()) {
+          safeSocketService.connect();
+        }
+        const peerId = getLocalPeerId(user);
+        socketService.joinRoom(roomId, {
+          username: peerId,
+          email: user?.email || peerId,
+          id: peerId,
+        });
         setTimeout(() => {
-          initializeVideoCall();
           setupSignaling();
+          const waitForSocket = (attempt = 0) => {
+            if (socketService.getSocketId()) {
+              initializeVideoCall();
+            } else if (attempt < 30) {
+              setTimeout(() => waitForSocket(attempt + 1), 100);
+            } else {
+              setError('Could not connect to signaling server. Please refresh.');
+              setConnectionStatus('error');
+            }
+          };
+          waitForSocket();
         }, 100);
       }
     } catch (error) {
       console.error('VideoCall component error:', error);
       setComponentError('Video call component failed to initialize. Please refresh the page.');
     }
-    
+
     return () => {
       try {
         cleanup();
@@ -313,167 +455,75 @@ function VideoCall({ roomId, onClose, participants = [] }) {
         console.error('Error during cleanup:', error);
       }
     };
-  }, [isAuthenticated]);
+  }, [user, roomId]);
+
+  const signalingHandlers = useRef({});
 
   const setupSignaling = () => {
     try {
-      // Socket service is guaranteed to be available at this point
-      console.log('🔌 Setting up WebRTC signaling');
-      console.log('🔌 Socket service available:', !!safeSocketService);
-      console.log('🔌 Socket connected:', safeSocketService.isConnected());
+      console.log('Setting up WebRTC signaling');
 
-      // Listen for incoming WebRTC offers
-      safeSocketService.on('webrtc-offer', async (data) => {
-        console.log('📥 WebRTC offer received:', data);
-        console.log('📥 Offer details - roomId:', data.roomId, 'expected:', roomId, 'from:', data.from, 'user:', user?.id);
-        console.log('📥 Offer type:', data.offer?.type, 'SDP length:', data.offer?.sdp?.length);
-        console.log('📥 Current remote streams:', remoteStreams.length);
-        console.log('📥 Current participants:', participants.length);
-        
-        const currentUserId = user?.id || user?.username || user?.email;
-        const fromUserId = data.from;
-        
-        if (data.roomId === roomId && fromUserId !== currentUserId) {
-          console.log('✅ Processing WebRTC offer from:', fromUserId);
-          console.log('✅ Starting handleIncomingOffer...');
+      const handlers = {
+        'webrtc-offer': async (data) => {
+          if (!isSignalForMe(data)) return;
           try {
             await handleIncomingOffer(data);
-            console.log('✅ handleIncomingOffer completed successfully');
           } catch (error) {
-            console.error('❌ handleIncomingOffer failed:', error);
-            console.error('❌ Error details:', error.message, error.stack);
+            console.error('handleIncomingOffer failed:', error);
           }
-        } else {
-          console.log('❌ Ignoring offer - roomId:', data.roomId, 'expected:', roomId, 'from:', fromUserId, 'user:', currentUserId);
-        }
-      });
-
-    // Listen for incoming WebRTC answers
-    safeSocketService.on('webrtc-answer', async (data) => {
-      console.log('📥 WebRTC answer received:', data);
-      console.log('📥 Answer details - roomId:', data.roomId, 'expected:', roomId, 'from:', data.from, 'user:', user?.id);
-      console.log('📥 Answer type:', data.answer?.type, 'SDP length:', data.answer?.sdp?.length);
-      console.log('📥 Peer connection exists:', !!peerConnections.current[data.from]);
-      
-      const currentUserId = user?.id || user?.username || user?.email;
-      const fromUserId = data.from;
-      
-      if (data.roomId === roomId && fromUserId !== currentUserId) {
-        console.log('✅ Processing WebRTC answer from:', fromUserId);
-        console.log('✅ Starting handleIncomingAnswer...');
-        try {
-          await handleIncomingAnswer(data);
-          console.log('✅ handleIncomingAnswer completed successfully');
-        } catch (error) {
-          console.error('❌ handleIncomingAnswer failed:', error);
-          console.error('❌ Error details:', error.message, error.stack);
-        }
-      } else {
-        console.log('❌ Ignoring answer - roomId:', data.roomId, 'expected:', roomId, 'from:', fromUserId, 'user:', currentUserId);
-      }
-    });
-
-    // Listen for ICE candidates
-    safeSocketService.on('webrtc-ice-candidate', async (data) => {
-      console.log('📥 ICE candidate received:', data);
-      console.log('📥 ICE details - roomId:', data.roomId, 'expected:', roomId, 'from:', data.from, 'user:', user?.id);
-      console.log('📥 ICE candidate:', data.candidate?.candidate, 'type:', data.candidate?.type);
-      console.log('📥 Peer connection exists:', !!peerConnections.current[data.from]);
-      
-      const currentUserId = user?.id || user?.username || user?.email;
-      const fromUserId = data.from;
-      
-      if (data.roomId === roomId && fromUserId !== currentUserId) {
-        console.log('✅ Processing ICE candidate from:', fromUserId);
-        console.log('✅ Starting handleIncomingIceCandidate...');
-        try {
-          await handleIncomingIceCandidate(data);
-          console.log('✅ handleIncomingIceCandidate completed successfully');
-        } catch (error) {
-          console.error('❌ handleIncomingIceCandidate failed:', error);
-          console.error('❌ Error details:', error.message, error.stack);
-        }
-      } else {
-        console.log('❌ Ignoring ICE candidate - roomId:', data.roomId, 'expected:', roomId, 'from:', fromUserId, 'user:', currentUserId);
-      }
-    });
-
-    // Listen for user join/leave events
-    safeSocketService.on('user-joined-video', (data) => {
-      console.log('📥 User joined video event received:', data);
-      console.log('📥 Event data details:', {
-        roomId: data.roomId,
-        expectedRoomId: roomId,
-        userId: data.userId,
-        currentUserId: user?.id,
-        username: data.username,
-        email: data.email
-      });
-      
-      const currentUserId = user?.id || user?.username || user?.email;
-      const participantId = data.userId || data.username || data.email;
-      
-      if (data.roomId === roomId && participantId !== currentUserId) {
-        console.log('✅ Processing user joined video call:', participantId);
-        
-        // Add participant to remoteStreams immediately
-        setRemoteStreams(prev => {
-          const existing = prev.find(s => s.id === participantId);
-          if (!existing) {
-            console.log('➕ Adding new participant from user-joined-video:', participantId);
-            const newParticipant = {
-              id: participantId,
-              name: data.username || data.email || `User ${participantId}`,
-              stream: null, // Will be set when WebRTC connection is established
-              isVideoEnabled: true,
-              isAudioEnabled: true,
-              connectionStatus: 'ready' // Ready to connect
-            };
-            console.log('➕ New participant object:', newParticipant);
-            return [...prev, newParticipant];
+        },
+        'webrtc-answer': async (data) => {
+          if (!isSignalForMe(data)) return;
+          try {
+            await handleIncomingAnswer(data);
+          } catch (error) {
+            console.error('handleIncomingAnswer failed:', error);
           }
-          console.log('👤 Participant already exists:', participantId);
-          return prev;
-        });
-        
-        // Start WebRTC connection with new user using robust strategy
-        const currentUserId = user?.id || user?.username || user?.email;
-        console.log('🚀 Starting WebRTC connection for new participant:', participantId);
-        console.log(`🚀 Current user ID: ${currentUserId}, New participant ID: ${participantId}`);
-        
-        const shouldInitiate = currentUserId < participantId || 
-                              Object.keys(peerConnections.current).length === 0;
-        
-        if (shouldInitiate) {
-          console.log(`🚀 Initiating WebRTC connection for new participant (we should initiate)`);
-          startWebRTCConnection(participantId, { userId: data.userId, username: data.username, email: data.email });
-        } else {
-          console.log(`🚀 Waiting for new participant to initiate connection (they should initiate)`);
-          // Set a timeout to initiate connection if the other user doesn't start it
-          setTimeout(() => {
-            if (!peerConnections.current[participantId]) {
-              console.log(`🚀 Timeout reached, initiating connection as fallback for new participant`);
-              startWebRTCConnection(participantId, { userId: data.userId, username: data.username, email: data.email });
-            }
-          }, 2000); // 2 second timeout
-        }
-      } else {
-        console.log('❌ Ignoring user-joined-video - roomId:', data.roomId, 'expected:', roomId, 'participantId:', participantId, 'user:', currentUserId);
-      }
-    });
+        },
+        'webrtc-ice-candidate': async (data) => {
+          if (!isSignalForMe(data)) return;
+          try {
+            await handleIncomingIceCandidate(data);
+          } catch (error) {
+            console.error('handleIncomingIceCandidate failed:', error);
+          }
+        },
+        'user-joined-video': (data) => {
+          const peerSocketId = data.socketId;
+          if (data.roomId !== roomId || !peerSocketId) return;
+          if (peerSocketId === getMySocketId()) return;
 
-    safeSocketService.on('user-left-video', (data) => {
-      if (data.roomId === roomId) {
-        console.log('User left video call:', data.userId);
-        // Clean up connection
-        if (peerConnections.current[data.userId]) {
-          peerConnections.current[data.userId].close();
-          delete peerConnections.current[data.userId];
-        }
-        // Remove from remote streams
-        setRemoteStreams(prev => prev.filter(s => s.id !== data.userId));
-      }
-    });
+          connectToPeer(peerSocketId, {
+            socketId: peerSocketId,
+            userId: data.userId,
+            username: data.username,
+            email: data.email,
+          });
+        },
+        'video-participants': (data) => {
+          if (data.roomId !== roomId || !Array.isArray(data.participants)) return;
+          const mySocketId = getMySocketId();
+          data.participants.forEach((p) => {
+            if (!p.socketId || p.socketId === mySocketId) return;
+            connectToPeer(p.socketId, p);
+          });
+        },
+        'user-left-video': (data) => {
+          if (data.roomId !== roomId) return;
+          const leftSocketId = data.socketId;
+          if (!leftSocketId) return;
+          if (peerConnections.current[leftSocketId]) {
+            peerConnections.current[leftSocketId].close();
+            delete peerConnections.current[leftSocketId];
+          }
+          setRemoteStreams(prev => prev.filter(s => s.id !== leftSocketId));
+        },
+      };
+
+      signalingHandlers.current = handlers;
+      Object.entries(handlers).forEach(([event, fn]) => safeSocketService.on(event, fn));
+
+      signalingReady.current = true;
     } catch (error) {
       console.error('Error setting up WebRTC signaling:', error);
       setError('Failed to setup video call signaling. Please refresh the page.');
@@ -482,13 +532,10 @@ function VideoCall({ roomId, onClose, participants = [] }) {
 
   const cleanupSignaling = () => {
     try {
-      if (safeSocketService && typeof safeSocketService.off === 'function') {
-        safeSocketService.off('webrtc-offer');
-        safeSocketService.off('webrtc-answer');
-        safeSocketService.off('webrtc-ice-candidate');
-        safeSocketService.off('user-joined-video');
-        safeSocketService.off('user-left-video');
-      }
+      Object.entries(signalingHandlers.current).forEach(([event, fn]) => {
+        safeSocketService.off(event, fn);
+      });
+      signalingHandlers.current = {};
     } catch (error) {
       console.error('Error cleaning up WebRTC signaling:', error);
     }
@@ -519,6 +566,48 @@ function VideoCall({ roomId, onClose, participants = [] }) {
 
     return () => clearTimeout(timeoutId);
   }, [localStream, setVideoStreamSafely]);
+
+  const startCallWithStream = (stream) => {
+    localStreamRef.current = stream;
+    setLocalStream(stream);
+    setIsVideoEnabled(stream.getVideoTracks().length > 0);
+    setIsAudioEnabled(stream.getAudioTracks().length > 0);
+
+    const setVideoStream = (retryCount = 0) => {
+      if (localVideoRef.current) {
+        setVideoStreamSafely(stream);
+        return;
+      }
+      if (retryCount < 50) {
+        setTimeout(() => setVideoStream(retryCount + 1), 100);
+      } else if (stream.getVideoTracks().length > 0) {
+        setError('Video element failed to initialize. Please refresh and try again.');
+        setConnectionStatus('error');
+      }
+    };
+
+    setVideoStream();
+    setConnectionStatus('connected');
+    setError('');
+    setupWebRTCConnections();
+  };
+
+  const joinReceiveOnly = async () => {
+    try {
+      setError('');
+      setConnectionStatus('connecting');
+      localStreamRef.current = null;
+      setLocalStream(null);
+      setIsVideoEnabled(false);
+      setIsAudioEnabled(false);
+      setConnectionStatus('connected');
+      setupWebRTCConnections();
+    } catch (err) {
+      console.error('Receive-only join failed:', err);
+      setError('Could not join the call. Please refresh and try again.');
+      setConnectionStatus('error');
+    }
+  };
 
   const initializeVideoCall = async () => {
     try {
@@ -568,82 +657,38 @@ function VideoCall({ roomId, onClose, participants = [] }) {
           autoGainControl: true
         }
       });
-      
-      localStreamRef.current = stream;
-      setLocalStream(stream);
-      
-      // Set video stream immediately
-      const setVideoStream = (retryCount = 0) => {
-        if (localVideoRef.current) {
-          setVideoStreamSafely(stream);
-          return;
-        }
-        
-        if (retryCount < 50) { // Max 5 seconds of retries
-          setTimeout(() => setVideoStream(retryCount + 1), 100);
-        } else {
-          console.error('Video element not ready after 5 seconds');
-          setError('Video element failed to initialize. Please refresh and try again.');
-          setConnectionStatus('error');
-        }
-      };
-      
-      // Start immediately
-      setVideoStream();
-      
-      // Set connection status to 'connected' since we have local video
-      setConnectionStatus('connected');
-      
-      // Set up WebRTC connections
-      setupWebRTCConnections();
-      
-      // Set a timeout to detect stuck connections (only for multi-participant calls)
-      const timeout = setTimeout(() => {
-        if (connectionStatus === 'connecting' && participants.length > 1) {
-          console.log('⚠️ Connection appears to be stuck');
-          setError('Connection appears to be stuck. Please try refreshing or check your network connection.');
-          
-          // Try to recover by re-emitting user-joined-video
-          try {
-            safeSocketService.emit('user-joined-video', {
-              roomId,
-              userId: user?.id,
-              username: user?.username || user?.email
-            });
-          } catch (error) {
-            console.error('Recovery emit failed:', error);
-          }
-        }
-      }, 15000); // 15 second timeout
-      
-      setConnectionTimeout(timeout);
+
+      startCallWithStream(stream);
       
     } catch (err) {
+      if (err.name === 'NotReadableError') {
+        try {
+          const audioOnly = await navigator.mediaDevices.getUserMedia({
+            audio: {
+              echoCancellation: true,
+              noiseSuppression: true,
+              autoGainControl: true,
+            },
+            video: false,
+          });
+          startCallWithStream(audioOnly);
+          return;
+        } catch (audioErr) {
+          console.warn('Camera busy; audio-only also failed:', audioErr);
+        }
+      }
+      if (err.name === 'NotAllowedError') {
+        console.warn('Camera/mic denied — joining receive-only so signaling still works');
+        await joinReceiveOnly();
+        return;
+      }
+
       console.error('Error accessing camera/microphone:', err);
       
       let errorMessage = 'Unable to access camera/microphone. ';
       let detailedInstructions = '';
       
-      if (err.name === 'NotAllowedError') {
-        errorMessage += 'Permission denied. ';
-        detailedInstructions = `
-          <div style="text-align: left; margin-top: 15px;">
-            <h4>To fix this issue:</h4>
-            <ol>
-              <li>Look for the camera/microphone icon in your browser's address bar</li>
-              <li>Click on it and select "Allow" for camera and microphone</li>
-              <li>If you don't see the icon, check your browser's site settings</li>
-              <li>Refresh the page and try again</li>
-            </ol>
-            <p><strong>Browser-specific instructions:</strong></p>
-            <ul>
-              <li><strong>Chrome:</strong> Click the lock icon → Site settings → Camera/Microphone → Allow</li>
-              <li><strong>Firefox:</strong> Click the shield icon → Permissions → Camera/Microphone → Allow</li>
-              <li><strong>Safari:</strong> Safari menu → Preferences → Websites → Camera/Microphone → Allow</li>
-            </ul>
-          </div>
-        `;
-      } else if (err.name === 'NotFoundError') {
+      if (err.name === 'NotFoundError') {
         errorMessage += 'No camera or microphone found. ';
         detailedInstructions = `
           <div style="text-align: left; margin-top: 15px;">
@@ -657,15 +702,14 @@ function VideoCall({ roomId, onClose, participants = [] }) {
           </div>
         `;
       } else if (err.name === 'NotReadableError') {
-        errorMessage += 'Camera or microphone is being used by another application. ';
+        errorMessage += 'Camera is in use (often another browser tab on the same PC). ';
         detailedInstructions = `
           <div style="text-align: left; margin-top: 15px;">
-            <h4>To fix this issue:</h4>
+            <h4>Testing with two browsers on one computer?</h4>
             <ol>
-              <li>Close other applications that might be using your camera/microphone</li>
-              <li>Check for video conferencing apps, streaming software, or other browsers</li>
-              <li>Restart your browser</li>
-              <li>Try refreshing the page</li>
+              <li>Keep camera on in <strong>one</strong> tab only</li>
+              <li>Click <strong>Join without camera</strong> below to watch the other person</li>
+              <li>Or close the other tab’s video call, then click Try Again</li>
             </ol>
           </div>
         `;
@@ -717,72 +761,23 @@ function VideoCall({ roomId, onClose, participants = [] }) {
   };
 
   const setupWebRTCConnections = () => {
-    // Set up WebRTC peer connections for each participant
-    const currentUserId = user?.id || user?.username || user?.email;
-    
-    const otherParticipants = participants.filter(p => {
-      const participantId = p.userId || p.username || p.email || p.id;
-      const isNotCurrentUser = participantId !== currentUserId;
-      return isNotCurrentUser;
-    });
-    
-    // If no other participants, set connection status to connected (solo call)
-    if (otherParticipants.length === 0) {
-      console.log('Solo call - no other participants, showing local video only');
-      setConnectionStatus('connected');
-      return;
-    }
-    
-    // Add participants to remoteStreams immediately
-    setRemoteStreams(prev => {
-      const newParticipants = otherParticipants.map(participant => ({
-        id: participant.userId || participant.username || participant.email,
-        name: participant.username || participant.email || `User ${participant.userId || participant.username}`,
-        stream: null,
-        isVideoEnabled: true,
-        isAudioEnabled: true,
-        connectionStatus: 'ready'
-      }));
-      
-      // Merge with existing participants, avoiding duplicates
-      const existingIds = prev.map(p => p.id);
-      const uniqueNewParticipants = newParticipants.filter(p => !existingIds.includes(p.id));
-      
-      return [...prev, ...uniqueNewParticipants];
-    });
-    
-    // Start connections with a shorter delay
-    setTimeout(() => {
-      otherParticipants.forEach((participant) => {
-        const participantId = participant.userId || participant.username || participant.email;
-        
-        // Check if connection already exists
-        if (peerConnections.current[participantId]) {
-          return;
-        }
-        
-        startWebRTCConnection(participantId, participant);
-      });
-    }, 500);
-
-    // Notify other participants that we joined the video call
-    try {
-      const emitData = {
-        roomId,
-        userId: user?.id,
-        username: user?.username || user?.email
-      };
-      safeSocketService.emit('user-joined-video', emitData);
-    } catch (error) {
-      console.error('Failed to emit user-joined-video:', error);
-    }
+    setConnectionStatus('connected');
+    announceVideoJoin();
   };
 
-  const startWebRTCConnection = async (userId, participant = null) => {
-    // Update connection status to 'connecting'
-    setRemoteStreams(prev => {
-      return prev.map(s => s.id === userId ? { ...s, connectionStatus: 'connecting' } : s);
-    });
+  const startWebRTCConnection = async (peerSocketId, participant = null, initiateOffer = true) => {
+    const mySocketId = getMySocketId();
+    if (!mySocketId) {
+      console.warn('No socket id — skipping WebRTC connection');
+      return null;
+    }
+    if (peerConnections.current[peerSocketId]) {
+      return peerConnections.current[peerSocketId];
+    }
+
+    setRemoteStreams(prev =>
+      prev.map(s => (s.id === peerSocketId ? { ...s, connectionStatus: 'connecting' } : s))
+    );
 
     const peerConnection = new RTCPeerConnection({
       iceServers: [
@@ -798,182 +793,156 @@ function VideoCall({ roomId, onClose, participants = [] }) {
       iceTransportPolicy: 'all'
     });
 
-    // Add local stream to peer connection
+    if (peerConnections.current[peerSocketId]) {
+      peerConnection.close();
+      return peerConnections.current[peerSocketId];
+    }
+    peerConnections.current[peerSocketId] = peerConnection;
+
     if (localStreamRef.current) {
       localStreamRef.current.getTracks().forEach(track => {
         peerConnection.addTrack(track, localStreamRef.current);
       });
+    } else {
+      peerConnection.addTransceiver('video', { direction: 'recvonly' });
+      peerConnection.addTransceiver('audio', { direction: 'recvonly' });
     }
 
-    // Handle remote stream
     peerConnection.ontrack = (event) => {
       const [remoteStream] = event.streams;
-      
       setRemoteStreams(prev => {
-        const existing = prev.find(s => s.id === userId);
+        const existing = prev.find(s => s.id === peerSocketId);
         if (existing) {
-          return prev.map(s => s.id === userId ? { ...s, stream: remoteStream, connectionStatus: 'connected' } : s);
-        } else {
-          return [...prev, {
-            id: userId,
-            name: participant?.username || participant?.email || `User ${userId}`,
+          return prev.map(s =>
+            s.id === peerSocketId
+              ? { ...s, stream: remoteStream, connectionStatus: 'connected' }
+              : s
+          );
+        }
+        return [
+          ...prev,
+          {
+            id: peerSocketId,
+            name: displayName(participant, participant?.username || 'Guest'),
             stream: remoteStream,
             isVideoEnabled: true,
             isAudioEnabled: true,
-            connectionStatus: 'connected'
-          }];
-        }
+            connectionStatus: 'connected',
+          },
+        ];
       });
+      setConnectionStatus('connected');
     };
 
-    // Add connection state change monitoring
     peerConnection.onconnectionstatechange = () => {
-      if (peerConnection.connectionState === 'connected') {
-        // Connection established
-      } else if (peerConnection.connectionState === 'failed') {
-        setRemoteStreams(prev => prev.map(s => s.id === userId ? { ...s, connectionStatus: 'failed' } : s));
+      if (peerConnection.connectionState === 'failed') {
+        setRemoteStreams(prev =>
+          prev.map(s => (s.id === peerSocketId ? { ...s, connectionStatus: 'failed' } : s))
+        );
       } else if (peerConnection.connectionState === 'disconnected') {
-        setRemoteStreams(prev => prev.map(s => s.id === userId ? { ...s, connectionStatus: 'disconnected' } : s));
+        setRemoteStreams(prev =>
+          prev.map(s => (s.id === peerSocketId ? { ...s, connectionStatus: 'disconnected' } : s))
+        );
       }
     };
 
-    // Add ICE connection state monitoring
     peerConnection.oniceconnectionstatechange = () => {
-      if (peerConnection.iceConnectionState === 'connected' || peerConnection.iceConnectionState === 'completed') {
-        setRemoteStreams(prev => prev.map(s => s.id === userId ? { ...s, connectionStatus: 'connected' } : s));
+      if (
+        peerConnection.iceConnectionState === 'connected' ||
+        peerConnection.iceConnectionState === 'completed'
+      ) {
+        setRemoteStreams(prev =>
+          prev.map(s => (s.id === peerSocketId ? { ...s, connectionStatus: 'connected' } : s))
+        );
         setConnectionStatus('connected');
       } else if (peerConnection.iceConnectionState === 'failed') {
-        // Retry ICE connection
         setTimeout(() => {
-          if (peerConnections.current[userId]) {
-            peerConnections.current[userId].restartIce();
+          if (peerConnections.current[peerSocketId]) {
+            peerConnections.current[peerSocketId].restartIce();
           }
         }, 2000);
-        
-        setRemoteStreams(prev => prev.map(s => s.id === userId ? { ...s, connectionStatus: 'ice-retrying' } : s));
-      } else if (peerConnection.iceConnectionState === 'checking') {
-        setRemoteStreams(prev => prev.map(s => s.id === userId ? { ...s, connectionStatus: 'connecting' } : s));
+        setRemoteStreams(prev =>
+          prev.map(s => (s.id === peerSocketId ? { ...s, connectionStatus: 'ice-retrying' } : s))
+        );
       }
     };
 
-    // Handle ICE candidates
     peerConnection.onicecandidate = (event) => {
-      if (event.candidate) {
-        try {
-          safeSocketService.emit('webrtc-ice-candidate', {
-            roomId,
-            to: userId,
-            from: user?.id,
-            candidate: event.candidate
-          });
-        } catch (error) {
-          console.error('Failed to emit ICE candidate:', error);
-        }
+      if (event.candidate && mySocketId) {
+        safeSocketService.emit('webrtc-ice-candidate', {
+          roomId,
+          to: peerSocketId,
+          from: mySocketId,
+          candidate: event.candidate,
+        });
       }
     };
 
-    peerConnections.current[userId] = peerConnection;
+    if (!initiateOffer) {
+      return peerConnection;
+    }
 
-    // Set up connection timeout with multiple retry strategies
-    const connectionTimeout = setTimeout(() => {
-      if (peerConnection.connectionState !== 'connected' && peerConnection.connectionState !== 'completed') {
-        console.log(`⏰ Connection timeout for ${userId}, current state: ${peerConnection.connectionState}`);
-        console.log(`🔄 Attempting multiple retry strategies for ${userId}`);
-        
-        // Strategy 1: Restart ICE
-        console.log(`🔄 Strategy 1: Restarting ICE for ${userId}`);
-        try {
-          peerConnection.restartIce();
-        } catch (error) {
-          console.error('❌ ICE restart failed:', error);
-        }
-        
-        // Strategy 2: Close and retry connection
-        setTimeout(() => {
-          if (peerConnections.current[userId]) {
-            console.log(`🔄 Strategy 2: Closing and retrying connection for ${userId}`);
-            peerConnections.current[userId].close();
-            delete peerConnections.current[userId];
-            
-            // Retry the connection
-            setTimeout(() => {
-              console.log(`🔄 Strategy 2: Retrying connection for ${userId}`);
-              startWebRTCConnection(userId, participant);
-            }, 1000);
-          }
-        }, 3000);
-        
-        // Strategy 3: Force re-emit user-joined-video
-        setTimeout(() => {
-          console.log(`🔄 Strategy 3: Re-emitting user-joined-video for ${userId}`);
-          try {
-            safeSocketService.emit('user-joined-video', {
-              roomId,
-              userId: user?.id,
-              username: user?.username || user?.email
-            });
-          } catch (error) {
-            console.error('❌ Re-emit failed:', error);
-          }
-        }, 5000);
-        
-        setRemoteStreams(prev => prev.map(s => s.id === userId ? { ...s, connectionStatus: 'retrying' } : s));
+    const failTimeout = setTimeout(() => {
+      if (
+        peerConnection.connectionState !== 'connected' &&
+        peerConnection.iceConnectionState !== 'connected' &&
+        peerConnection.iceConnectionState !== 'completed'
+      ) {
+        setRemoteStreams(prev =>
+          prev.map(s =>
+            s.id === peerSocketId && !s.stream
+              ? { ...s, connectionStatus: 'failed' }
+              : s
+          )
+        );
       }
-    }, 15000); // 15 second timeout
+    }, 20000);
 
-    // Clear timeout when connection succeeds
-    const originalOnTrack = peerConnection.ontrack;
-    peerConnection.ontrack = (event) => {
-      clearTimeout(connectionTimeout);
-      console.log(`🎉 Received remote stream from: ${userId}`);
-      console.log(`🎉 Stream tracks:`, event.streams[0]?.getTracks().map(t => ({ kind: t.kind, enabled: t.enabled, readyState: t.readyState })));
-      
-      // Update remote streams with actual video stream
-      setRemoteStreams(prev => prev.map(s => 
-        s.id === userId 
-          ? { ...s, stream: event.streams[0], connectionStatus: 'connected' }
-          : s
-      ));
-      
-      // Update overall connection status if this is the first successful connection
-      setConnectionStatus('connected');
-      
-      if (originalOnTrack) originalOnTrack(event);
-    };
+    peerConnection.addEventListener('connectionstatechange', () => {
+      if (peerConnection.connectionState === 'connected') {
+        clearTimeout(failTimeout);
+      }
+    });
 
-    // Create and send offer
     try {
       const offer = await peerConnection.createOffer({
         offerToReceiveAudio: true,
-        offerToReceiveVideo: true
+        offerToReceiveVideo: true,
       });
-      
-      // Set local description
       await peerConnection.setLocalDescription(offer);
-      
-      // Send offer immediately
-      try {
-        safeSocketService.emit('webrtc-offer', {
-          roomId,
-          to: userId,
-          from: user?.id,
-          offer: offer
-        });
-      } catch (error) {
-        console.error('Failed to emit WebRTC offer:', error);
-        setRemoteStreams(prev => prev.map(s => s.id === userId ? { ...s, connectionStatus: 'error' } : s));
-      }
-      
+      safeSocketService.emit('webrtc-offer', {
+        roomId,
+        to: peerSocketId,
+        from: mySocketId,
+        offer,
+      });
     } catch (error) {
       console.error('Error creating offer:', error);
-      setRemoteStreams(prev => prev.map(s => s.id === userId ? { ...s, connectionStatus: 'error' } : s));
+      setRemoteStreams(prev =>
+        prev.map(s => (s.id === peerSocketId ? { ...s, connectionStatus: 'error' } : s))
+      );
     }
   };
 
   const handleIncomingOffer = async (data) => {
-    const userId = data.from;
-    let peerConnection = peerConnections.current[userId];
-    
+    const peerSocketId = data.from;
+    const mySocketId = getMySocketId();
+    let peerConnection = peerConnections.current[peerSocketId];
+
+    if (peerConnection?.signalingState === 'have-local-offer') {
+      if (shouldInitiateOffer(mySocketId, peerSocketId)) {
+        return;
+      }
+      try {
+        await peerConnection.setLocalDescription({ type: 'rollback' });
+      } catch (rollbackErr) {
+        console.warn('Offer glare rollback failed:', rollbackErr?.message);
+        peerConnection.close();
+        delete peerConnections.current[peerSocketId];
+        peerConnection = null;
+      }
+    }
+
     if (!peerConnection) {
       peerConnection = new RTCPeerConnection({
         iceServers: [
@@ -981,108 +950,104 @@ function VideoCall({ roomId, onClose, participants = [] }) {
           { urls: 'stun:stun1.l.google.com:19302' },
           { urls: 'stun:stun2.l.google.com:19302' },
           { urls: 'stun:stun3.l.google.com:19302' },
-          { urls: 'stun:stun4.l.google.com:19302' }
+          { urls: 'stun:stun4.l.google.com:19302' },
         ],
         iceCandidatePoolSize: 10,
         bundlePolicy: 'max-bundle',
         rtcpMuxPolicy: 'require',
-        iceTransportPolicy: 'all'
+        iceTransportPolicy: 'all',
       });
 
-      // Add local stream to peer connection
       if (localStreamRef.current) {
         localStreamRef.current.getTracks().forEach(track => {
           peerConnection.addTrack(track, localStreamRef.current);
         });
+      } else {
+        peerConnection.addTransceiver('video', { direction: 'recvonly' });
+        peerConnection.addTransceiver('audio', { direction: 'recvonly' });
       }
 
-      // Handle remote stream
       peerConnection.ontrack = (event) => {
         const [remoteStream] = event.streams;
-        
         setRemoteStreams(prev => {
-          const existing = prev.find(s => s.id === userId);
+          const existing = prev.find(s => s.id === peerSocketId);
           if (existing) {
-            return prev.map(s => s.id === userId ? { ...s, stream: remoteStream, connectionStatus: 'connected' } : s);
-          } else {
-            return [...prev, {
-              id: userId,
-              name: `User ${userId}`,
+            return prev.map(s =>
+              s.id === peerSocketId
+                ? { ...s, stream: remoteStream, connectionStatus: 'connected' }
+                : s
+            );
+          }
+          return [
+            ...prev,
+            {
+              id: peerSocketId,
+              name: data.username || 'Guest',
               stream: remoteStream,
               isVideoEnabled: true,
               isAudioEnabled: true,
-              connectionStatus: 'connected'
-            }];
-          }
+              connectionStatus: 'connected',
+            },
+          ];
         });
+        setConnectionStatus('connected');
       };
 
-      // Add connection state change monitoring
-      peerConnection.onconnectionstatechange = () => {
-        if (peerConnection.connectionState === 'connected') {
-          // Connection established
-        } else if (peerConnection.connectionState === 'failed') {
-          setRemoteStreams(prev => prev.map(s => s.id === userId ? { ...s, connectionStatus: 'failed' } : s));
-        }
-      };
-
-      // Add ICE connection state monitoring
-      peerConnection.oniceconnectionstatechange = () => {
-        if (peerConnection.iceConnectionState === 'connected' || peerConnection.iceConnectionState === 'completed') {
-          // ICE connection established
-        } else if (peerConnection.iceConnectionState === 'failed') {
-          setRemoteStreams(prev => prev.map(s => s.id === userId ? { ...s, connectionStatus: 'ice-failed' } : s));
-        }
-      };
-
-      // Handle ICE candidates
       peerConnection.onicecandidate = (event) => {
-        if (event.candidate) {
-          try {
-            safeSocketService.emit('webrtc-ice-candidate', {
-              roomId,
-              to: userId,
-              from: user?.id,
-              candidate: event.candidate
-            });
-          } catch (error) {
-            console.error('Failed to emit ICE candidate:', error);
-          }
+        if (event.candidate && mySocketId) {
+          safeSocketService.emit('webrtc-ice-candidate', {
+            roomId,
+            to: peerSocketId,
+            from: mySocketId,
+            candidate: event.candidate,
+          });
         }
       };
 
-      peerConnections.current[userId] = peerConnection;
+      peerConnections.current[peerSocketId] = peerConnection;
+
+      setRemoteStreams(prev => {
+        if (prev.some(s => s.id === peerSocketId)) return prev;
+        return [
+          ...prev,
+          {
+            id: peerSocketId,
+            name: data.username || 'Guest',
+            stream: null,
+            isVideoEnabled: true,
+            isAudioEnabled: true,
+            connectionStatus: 'connecting',
+          },
+        ];
+      });
     }
 
     try {
       await peerConnection.setRemoteDescription(data.offer);
-      
+      await flushPendingCandidates(peerSocketId);
+
       const answer = await peerConnection.createAnswer();
-      
       await peerConnection.setLocalDescription(answer);
-      
-      try {
-        safeSocketService.emit('webrtc-answer', {
-          roomId,
-          to: userId,
-          from: user?.id,
-          answer: answer
-        });
-      } catch (error) {
-        console.error('Failed to emit WebRTC answer:', error);
-      }
+
+      safeSocketService.emit('webrtc-answer', {
+        roomId,
+        to: peerSocketId,
+        from: mySocketId,
+        answer,
+      });
     } catch (error) {
       console.error('Error handling offer:', error);
     }
   };
 
   const handleIncomingAnswer = async (data) => {
-    const userId = data.from;
-    const peerConnection = peerConnections.current[userId];
-    
+    const peerSocketId = data.from;
+    const peerConnection = peerConnections.current[peerSocketId];
+
     if (peerConnection) {
       try {
         await peerConnection.setRemoteDescription(data.answer);
+        await flushPendingCandidates(peerSocketId);
       } catch (error) {
         console.error('Error handling answer:', error);
       }
@@ -1090,15 +1055,20 @@ function VideoCall({ roomId, onClose, participants = [] }) {
   };
 
   const handleIncomingIceCandidate = async (data) => {
-    const userId = data.from;
-    const peerConnection = peerConnections.current[userId];
-    
-    if (peerConnection) {
-      try {
-        await peerConnection.addIceCandidate(data.candidate);
-      } catch (error) {
-        console.error('Error handling ICE candidate:', error);
-      }
+    const peerSocketId = data.from;
+    const peerConnection = peerConnections.current[peerSocketId];
+
+    if (!peerConnection || !data.candidate) return;
+
+    if (!peerConnection.remoteDescription) {
+      queueIceCandidate(peerSocketId, data.candidate);
+      return;
+    }
+
+    try {
+      await peerConnection.addIceCandidate(data.candidate);
+    } catch (error) {
+      console.error('Error handling ICE candidate:', error);
     }
   };
 
@@ -1176,7 +1146,8 @@ function VideoCall({ roomId, onClose, participants = [] }) {
     try {
       safeSocketService.emit('user-left-video', {
         roomId,
-        userId: user?.id
+        socketId: getMySocketId(),
+        userId: getLocalPeerId(user),
       });
     } catch (error) {
       console.error('Failed to emit user-left-video:', error);
@@ -1197,6 +1168,8 @@ function VideoCall({ roomId, onClose, participants = [] }) {
       }
     });
     peerConnections.current = {};
+    hasAnnouncedVideo.current = false;
+    signalingReady.current = false;
     
     // Clear state
     setLocalStream(null);
@@ -1208,12 +1181,12 @@ function VideoCall({ roomId, onClose, participants = [] }) {
     setError('');
   };
 
-  if (!isAuthenticated) {
+  if (!user) {
     return (
       <div className="video-call-overlay" onClick={onClose}>
         <div className="video-call-container" onClick={e => e.stopPropagation()}>
           <div className="error-message">
-            Please log in to join the video call.
+            Please wait for your session to load, or refresh the page.
           </div>
         </div>
       </div>
@@ -1277,6 +1250,14 @@ function VideoCall({ roomId, onClose, participants = [] }) {
           <div className="meet-error">
             <div className="error-icon">⚠️</div>
             <div className="error-text" dangerouslySetInnerHTML={{ __html: error }}></div>
+            <div style={{ display: 'flex', gap: '10px', justifyContent: 'center', marginTop: '16px', flexWrap: 'wrap' }}>
+              <button type="button" onClick={joinReceiveOnly} className="meet-control-btn meet-primary">
+                Join without camera
+              </button>
+              <button type="button" onClick={initializeVideoCall} className="meet-control-btn meet-secondary">
+                Try again
+              </button>
+            </div>
           </div>
         )}
 
@@ -1315,6 +1296,9 @@ function VideoCall({ roomId, onClose, participants = [] }) {
               <button onClick={initializeVideoCall} className="meet-control-btn meet-secondary">
                 🔄 Try Again
               </button>
+              <button type="button" onClick={joinReceiveOnly} className="meet-control-btn meet-primary">
+                Join without camera
+              </button>
               <button onClick={() => window.location.reload()} className="meet-control-btn meet-secondary">
                 🔄 Refresh Page
               </button>
@@ -1329,6 +1313,7 @@ function VideoCall({ roomId, onClose, participants = [] }) {
               {/* Local Video - Google Meet style */}
               <div className={`meet-participant local-participant ${remoteStreams.length === 0 ? 'solo-participant' : ''}`}>
                 <div className="meet-video-container">
+                  {localStream ? (
                   <video
                     ref={localVideoRef}
                     autoPlay
@@ -1342,18 +1327,23 @@ function VideoCall({ roomId, onClose, participants = [] }) {
                       backgroundColor: '#000',
                       border: remoteStreams.length === 0 ? 'none' : '2px solid #4285f4'
                     }}
-                    onLoadedMetadata={() => {
-                      // Video loaded successfully
-                    }}
                     onCanPlay={() => {
-                      if (localVideoRef.current && !localVideoRef.current.srcObject && localStream) {
-                        localVideoRef.current.srcObject = localStream;
+                      if (localVideoRef.current && localStream) {
+                        attachStreamToVideo(localVideoRef.current, localStream);
                       }
                     }}
                     onError={(e) => {
                       console.error('Local video error:', e);
                     }}
                   />
+                  ) : (
+                    <div className="meet-video-placeholder">
+                      <div className="meet-avatar">You</div>
+                      <div className="meet-participant-info">
+                        <span className="meet-participant-name">No camera</span>
+                      </div>
+                    </div>
+                  )}
                   <div className="meet-video-overlay">
                     <div className="participant-info">
                       <span className="participant-name">You</span>
@@ -1383,13 +1373,12 @@ function VideoCall({ roomId, onClose, participants = [] }) {
               {remoteStreams.map((participant, index) => (
                 <div key={participant.id} className="meet-participant remote-participant">
                   <div className="meet-video-container">
-                    {participant.stream && participant.isVideoEnabled ? (
+                    {participant.stream ? (
                       <video
-                        ref={el => {
+                        ref={(el) => {
                           remoteVideoRefs.current[index] = el;
                           if (el && participant.stream) {
-                            el.srcObject = participant.stream;
-                            el.play();
+                            attachStreamToVideo(el, participant.stream);
                           }
                         }}
                         autoPlay
