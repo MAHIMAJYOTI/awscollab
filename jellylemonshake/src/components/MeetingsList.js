@@ -1,9 +1,8 @@
 import React, { useState, useEffect } from 'react';
-import { useAuth } from './AuthContext';
+import { getApiUrl } from '../config';
 import '../styles/components/MeetingsList.css';
 
 function MeetingsList({ roomId, onClose, isVisible }) {
-  const { authUser } = useAuth();
   const [meetings, setMeetings] = useState([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
@@ -18,12 +17,12 @@ function MeetingsList({ roomId, onClose, isVisible }) {
     setLoading(true);
     setError('');
     try {
-      const apiUrl = process.env.REACT_APP_API_URL || 'http://awsproject-backend-prod.eba-fphuu5yq.us-east-1.elasticbeanstalk.com';
+      const apiUrl = getApiUrl();
       const response = await fetch(`${apiUrl}/api/meetings/room/${roomId}`);
       
       if (response.ok) {
         const data = await response.json();
-        setMeetings(data || []);
+        setMeetings(Array.isArray(data) ? data : data.meetings || []);
       } else {
         setError('Failed to load meetings');
       }
@@ -66,12 +65,17 @@ function MeetingsList({ roomId, onClose, isVisible }) {
       <div className="meetings-modal" onClick={(e) => e.stopPropagation()}>
         <div className="meetings-header">
           <h2>📅 Scheduled Meetings</h2>
-          <button className="close-button" onClick={onClose}>
+          <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
+            <button type="button" className="view-meeting-btn" onClick={loadMeetings} disabled={loading}>
+              Refresh
+            </button>
+            <button className="close-button" onClick={onClose}>
             <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
               <line x1="18" y1="6" x2="6" y2="18"></line>
               <line x1="6" y1="6" x2="18" y2="18"></line>
             </svg>
-          </button>
+            </button>
+          </div>
         </div>
 
         <div className="meetings-content">
@@ -89,7 +93,7 @@ function MeetingsList({ roomId, onClose, isVisible }) {
               {Array.isArray(meetings) && meetings.map((meeting) => {
                 const statusInfo = getMeetingStatus(meeting);
                 return (
-                  <div key={meeting._id} className="meeting-item">
+                  <div key={meeting.meetingId || meeting._id} className="meeting-item">
                     <div className="meeting-header-info">
                       <h3>{meeting.title}</h3>
                       <span 
@@ -115,26 +119,17 @@ function MeetingsList({ roomId, onClose, isVisible }) {
                         <strong>👤 Organizer:</strong> {meeting.organizer}
                       </div>
                       <div className="detail-row">
-                        <strong>👥 Participants:</strong> {meeting.participants.length}
+                        <strong>👥 Participants:</strong> {(meeting.participants || []).length}
                       </div>
                     </div>
 
                     <div className="meeting-actions">
-                      {(statusInfo.status === 'Active' || statusInfo.status === 'Ready to Start') && (
+                      {statusInfo.status !== 'Completed' && (
                         <button 
-                          onClick={() => joinMeeting(meeting.meetingId)}
+                          onClick={() => joinMeeting(meeting.meetingId || meeting.id)}
                           className="join-meeting-btn"
                         >
-                          🎥 Join Meeting
-                        </button>
-                      )}
-                      
-                      {statusInfo.status === 'Scheduled' && (
-                        <button 
-                          onClick={() => joinMeeting(meeting.meetingId)}
-                          className="view-meeting-btn"
-                        >
-                          👁️ View Details
+                          🎥 {statusInfo.status === 'Scheduled' ? 'Open Meeting' : 'Join Meeting'}
                         </button>
                       )}
                     </div>

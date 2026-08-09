@@ -1,15 +1,20 @@
 import React, { useState, useEffect } from 'react';
 import { useAuth } from './AuthContext';
+import { getApiUrl } from '../config';
 import '../styles/components/MeetingScheduler.css';
 
+const getParticipantName = (p) => {
+  if (typeof p === 'string') return p;
+  return p?.username || p?.email || '';
+};
+
 function MeetingScheduler({ roomId, participants, onClose, onMeetingCreated }) {
-  const { user, isAuthenticated } = useAuth();
+  const { user, authUser, isAuthenticated } = useAuth();
   
-  // Early return if user is not authenticated
-  if (!isAuthenticated) {
+  if (!user) {
     return (
       <div className="error-message">
-        Please log in to schedule a meeting.
+        Please wait for your session to load.
       </div>
     );
   }
@@ -30,6 +35,16 @@ function MeetingScheduler({ roomId, participants, onClose, onMeetingCreated }) {
     recurringInterval: 1,
     recurringEndDate: ''
   });
+  const organizerName = authUser?.username || authUser?.email || user?.username || user?.email || 'Guest';
+
+  const roomParticipants = (participants || [])
+    .map(getParticipantName)
+    .filter(Boolean);
+
+  const otherParticipants = roomParticipants.filter(
+    (name) => name !== organizerName
+  );
+
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
   const [success, setSuccess] = useState('');
@@ -81,18 +96,14 @@ function MeetingScheduler({ roomId, participants, onClose, onMeetingCreated }) {
     }
     
     const scheduledDate = new Date(formData.scheduledTime);
-    if (scheduledDate <= new Date()) {
+    const oneMinuteAgo = new Date(Date.now() - 60 * 1000);
+    if (scheduledDate < oneMinuteAgo) {
       setError('Meeting time must be in the future');
       return false;
     }
     
     if (formData.requirePassword && !formData.password.trim()) {
       setError('Please enter a password for the meeting');
-      return false;
-    }
-    
-    if (formData.selectedParticipants.length === 0) {
-      setError('Please select at least one participant');
       return false;
     }
     
@@ -111,36 +122,35 @@ function MeetingScheduler({ roomId, participants, onClose, onMeetingCreated }) {
     setSuccess('');
 
     try {
+      const participantSet = new Set([
+        organizerName,
+        ...formData.selectedParticipants,
+      ]);
+
       const meetingData = {
         title: formData.title.trim(),
         description: formData.description.trim(),
         roomId,
-        organizer: user.username || user.email,
-        participants: formData.selectedParticipants,
-        scheduledTime: formData.scheduledTime,
-        duration: parseInt(formData.duration),
+        organizer: organizerName,
+        participants: Array.from(participantSet),
+        scheduledTime: new Date(formData.scheduledTime).toISOString(),
+        duration: parseInt(formData.duration, 10),
         settings: {
           allowScreenShare: formData.allowScreenShare,
           allowChat: formData.allowChat,
           requirePassword: formData.requirePassword,
           password: formData.requirePassword ? formData.password : '',
-          maxParticipants: parseInt(formData.maxParticipants)
+          maxParticipants: parseInt(formData.maxParticipants, 10)
         },
         isRecurring: formData.isRecurring,
-        recurringPattern: formData.isRecurring ? {
+        recurringSettings: formData.isRecurring ? {
           frequency: formData.recurringFrequency,
-          interval: parseInt(formData.recurringInterval),
+          interval: parseInt(formData.recurringInterval, 10),
           endDate: formData.recurringEndDate || null
         } : null
       };
 
-      const apiUrl = process.env.REACT_APP_API_URL || 'http://awsproject-backend-prod.eba-fphuu5yq.us-east-1.elasticbeanstalk.com';
-      
-      // Test API connection first
-      const statusResponse = await fetch(`${apiUrl}/api/meetings/debug/status`);
-      if (!statusResponse.ok) {
-        throw new Error('Meeting API is not responding. Please check your connection.');
-      }
+      const apiUrl = getApiUrl();
       
       const response = await fetch(`${apiUrl}/api/meetings/create`, {
         method: 'POST',
@@ -256,37 +266,35 @@ function MeetingScheduler({ roomId, participants, onClose, onMeetingCreated }) {
                   type="button"
                   className="select-all-btn"
                   onClick={() => {
-                    const allParticipants = participants
-                      .filter(p => p.username !== (user.username || user.email))
-                      .map(p => p.username);
                     setFormData(prev => ({
                       ...prev,
-                      selectedParticipants: formData.selectedParticipants.length === allParticipants.length 
-                        ? [] 
-                        : allParticipants
+                      selectedParticipants: prev.selectedParticipants.length === otherParticipants.length
+                        ? []
+                        : [...otherParticipants]
                     }));
                   }}
                 >
-                  {formData.selectedParticipants.length === participants.filter(p => p.username !== (user.username || user.email)).length 
+                  {formData.selectedParticipants.length === otherParticipants.length && otherParticipants.length > 0
                     ? 'Deselect All' 
                     : 'Select All'}
                 </button>
               </div>
             </div>
             <div className="participants-list">
-              {participants.filter(p => p.username !== (user.username || user.email)).length === 0 ? (
-                <div className="no-participants">No other participants in this room</div>
+              {otherParticipants.length === 0 ? (
+                <div className="no-participants">
+                  No other members in this room yet — you can still schedule (you will be added as organizer).
+                </div>
               ) : (
-                participants.filter(p => p.username !== (user.username || user.email)).map(participant => (
-                  <label key={participant.username} className="participant-checkbox" htmlFor={`participant-${participant.username}`}>
+                otherParticipants.map((participantName) => (
+                  <label key={participantName} className="participant-checkbox" htmlFor={`participant-${participantName}`}>
                     <input
                       type="checkbox"
-                      id={`participant-${participant.username}`}
-                      checked={formData.selectedParticipants.includes(participant.username)}
-                      onChange={() => handleParticipantToggle(participant.username)}
+                      id={`participant-${participantName}`}
+                      checked={formData.selectedParticipants.includes(participantName)}
+                      onChange={() => handleParticipantToggle(participantName)}
                     />
-                    <span className="participant-name">{participant.username}</span>
-                    <span className="participant-status">{participant.isOnline ? 'Online' : 'Offline'}</span>
+                    <span className="participant-name">{participantName}</span>
                   </label>
                 ))
               )}
