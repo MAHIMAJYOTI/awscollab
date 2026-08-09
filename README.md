@@ -1,16 +1,37 @@
-# AWS Collaboration Platform
+# CloudCollab — AWS Collaboration Platform
 
-Real-time chat, meetings, video calls, and collaborative coding.
+Real-time chat, meetings, WebRTC video calls, collaborative editing, and multi-language code execution — deployed on AWS.
 
-**Current focus:** fix and test everything locally first, then connect real AWS DynamoDB, then deploy later.
+## Live demo
+
+| Service | URL |
+|---------|-----|
+| **App** | http://cloudcollab-frontend-545595341712.s3-website-us-east-1.amazonaws.com |
+| **API** | http://awsproject-backend-prod.eba-2aum2wgj.us-east-1.elasticbeanstalk.com |
+| **Health** | http://awsproject-backend-prod.eba-2aum2wgj.us-east-1.elasticbeanstalk.com/health |
 
 ## Features
 
-- Real-time chat (Socket.IO)
-- User authentication (custom API)
-- Meeting scheduling and instant meetings
-- WebRTC video calls
-- Collaborative code editor and JDoodle execution
+- **Real-time chat** — Socket.IO rooms, typing indicators, message search
+- **Authentication** — signup/login, bcrypt hashing, forgot/reset password
+- **Meetings** — schedule, join, instant meetings
+- **Video calls** — WebRTC peer connections with socket-based signaling
+- **Collaborative editor** — shared document editing in chat rooms
+- **Code execution** — JDoodle API (12+ languages) with local fallback for Node.js/Python
+- **Admin panel** — room members, moderation
+
+## Architecture
+
+```
+Browser (React on S3)
+        │  REST + WebSocket
+        ▼
+Elastic Beanstalk (Node.js + Express + Socket.IO)
+        │
+        ▼
+DynamoDB (6 on-demand tables)
+  ChatRooms · Messages · Meetings · Users · Projects · ProjectFiles
+```
 
 ## Tech stack
 
@@ -18,85 +39,124 @@ Real-time chat, meetings, video calls, and collaborative coding.
 |-------|------------|
 | Frontend | React (`jellylemonshake/`) |
 | Backend | Node.js, Express, Socket.IO (`backend/`) |
-| Database | AWS DynamoDB (or local file store for dev) |
+| Database | AWS DynamoDB (or local JSON file for offline dev) |
+| Deploy | S3 static hosting + Elastic Beanstalk |
 
-## Development phases
+## Quick start (local)
 
-### Phase 1 — Local (no AWS) ← you are here
+### Option A — Local file store (no AWS account)
 
-Uses `backend/data/local-db.json`. No AWS account needed.
-
-```bash
-# Terminal 1
+```powershell
+# Terminal 1 — backend
 cd backend
-cp .env.example .env   # USE_LOCAL_STORE=true by default
+cp .env.example .env          # USE_LOCAL_STORE=true by default
 npm install
 npm start
 
-# Terminal 2
+# Terminal 2 — frontend
 cd jellylemonshake
 npm install
 npm start
 ```
 
-- Frontend: http://localhost:3000  
-- Backend: http://localhost:5000  
+- Frontend: http://localhost:3000
+- Backend: http://localhost:5000
 
-### Phase 2 — Local + real AWS DynamoDB
+Data is stored in `backend/data/local-db.json` (gitignored).
 
-When ready to test with real AWS:
+### Option B — Local dev + AWS DynamoDB
 
-1. In `backend/.env`:
-   ```
+1. Set in `backend/.env`:
+   ```env
    USE_LOCAL_STORE=false
    AWS_REGION=us-east-1
    AWS_ACCESS_KEY_ID=your_key
    AWS_SECRET_ACCESS_KEY=your_secret
    ```
-2. Create tables: `cd backend && npm run setup-aws` (or `npm run create-tables`)
-3. (Optional) Copy local test data: included in `setup-aws`, or `npm run migrate-to-aws`
-4. Verify: `npm run check-setup`
-5. Check live status: `GET http://localhost:5000/api/setup/status`
-6. Restart backend
+2. Create tables and migrate data:
+   ```powershell
+   cd backend
+   npm run setup-aws
+   ```
+3. Verify: `npm run check-setup` or `GET http://localhost:5000/api/setup/status`
+4. Start backend and frontend as above.
 
-Frontend stays on `http://localhost:5000` via `jellylemonshake/.env.development`.
+### Option C — Docker
 
-### Phase 2b — Docker (optional, no AWS needed)
+Requires [Docker Desktop](https://www.docker.com/products/docker-desktop/) running.
 
-**Install Docker Desktop (one-time):**
-1. Download: https://www.docker.com/products/docker-desktop/
-2. Run installer → enable WSL 2 when asked → restart if prompted
-3. Open **Docker Desktop** and wait until it says **Engine running**
-
-**Run the full stack in containers:**
-```bash
-# Stop any local npm servers on ports 3000/5000 first
-npm run docker:up
+```powershell
+npm run docker:up      # start
+npm run docker:down    # stop
 ```
 
-- Frontend: http://localhost:3000  
-- Backend: http://localhost:5000  
-- Uses local JSON storage (`USE_LOCAL_STORE=true`) — **no AWS account**
+Uses local JSON storage — no AWS credentials needed. Your existing `backend/data/` folder is mounted into the container.
 
-Stop containers: `npm run docker:down`
+## Deploy to AWS
 
-**Note:** Your existing `backend/data/` folder is mounted into the container, so rooms/users/messages are preserved.
+One-command deploy (uses credentials from `backend/.env`):
 
-### Phase 3 — Deploy (later)
+```powershell
+cd backend
+npm run deploy:aws
+```
 
-Deploy only after local + AWS testing passes. See `AWS_DEPLOYMENT_GUIDE.md` when you get there.
+Or from the project root: `npm run deploy:aws`
+
+See **[DEPLOY_AWS.md](./DEPLOY_AWS.md)** for IAM permissions, architecture details, and troubleshooting.
+
+### Required IAM policies (deploy user)
+
+| Policy | Purpose |
+|--------|---------|
+| `AmazonDynamoDBFullAccess` | Database |
+| `AmazonS3FullAccess` | Frontend + deploy artifacts |
+| `AdministratorAccess-AWSElasticBeanstalk` | Backend hosting |
+| `IAMFullAccess` | EB instance roles (first deploy only) |
 
 ## Project layout
 
 ```
 awsproject/
-├── jellylemonshake/   # React frontend
-├── backend/           # Express + Socket.IO API
-│   └── data/          # Local DB (gitignored) when USE_LOCAL_STORE=true
+├── jellylemonshake/          # React frontend
+├── backend/                  # Express + Socket.IO API
+│   ├── config/               # DynamoDB + local store adapters
+│   ├── scripts/              # AWS setup, migration, deploy
+│   ├── data/                 # Local DB (gitignored)
+│   └── .ebextensions/        # Elastic Beanstalk config
 ├── docker-compose.yml
-└── AWS_DEPLOYMENT_GUIDE.md
+├── DEPLOY_AWS.md             # Deployment guide
+└── AWS_DEPLOYMENT_GUIDE.md   # Legacy bash deploy scripts
 ```
+
+## Useful scripts
+
+| Command | Location | Description |
+|---------|----------|-------------|
+| `npm start` | `backend/` | Start API server |
+| `npm start` | `jellylemonshake/` | Start React dev server |
+| `npm run setup-aws` | `backend/` | Create DynamoDB tables + migrate local data |
+| `npm run deploy:aws` | `backend/` | Deploy to Elastic Beanstalk + S3 |
+| `npm run docker:up` | root | Run full stack in Docker |
+
+## Environment variables
+
+Copy `backend/.env.example` → `backend/.env`. Key settings:
+
+| Variable | Description |
+|----------|-------------|
+| `USE_LOCAL_STORE` | `true` = local JSON file, `false` = AWS DynamoDB |
+| `AWS_REGION` | AWS region (default `us-east-1`) |
+| `JDOODLE_CLIENT_ID` / `JDOODLE_CLIENT_SECRET` | Code execution API (optional) |
+| `FRONTEND_URL` | Used in password-reset email links |
+
+Frontend URLs are set in `jellylemonshake/.env.development` (local) and baked in at build time for production deploy.
 
 ## GitHub
 
 https://github.com/MAHIMAJYOTI/awscollab
+
+## Notes
+
+- **Video calls in production** may require HTTPS (browsers restrict camera access on HTTP). Chat, auth, and meetings work over HTTP.
+- Started as a team project; rebuilt and extended with working chat, video, AWS integration, and full deployment.
