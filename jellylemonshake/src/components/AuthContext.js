@@ -3,48 +3,46 @@ import { api } from './api';
 
 const AuthContext = createContext();
 
+const createGuestUser = () => {
+  const stored = localStorage.getItem('guestUser');
+  if (stored) {
+    try {
+      return JSON.parse(stored);
+    } catch {
+      localStorage.removeItem('guestUser');
+    }
+  }
+  const guestUser = {
+    id: 'guest-' + Math.random().toString(36).substring(2, 10),
+    username: 'Guest' + Math.floor(Math.random() * 10000),
+    isGuest: true,
+  };
+  localStorage.setItem('guestUser', JSON.stringify(guestUser));
+  return guestUser;
+};
+
 export function AuthProvider({ children }) {
   const [user, setUser] = useState(null);
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
-    // Get initial session
     const getInitialSession = async () => {
       try {
-        // Check if user is logged in
         const token = localStorage.getItem('authToken');
         if (token) {
           const response = await api.getCurrentUser();
           if (response.success) {
             setUser(response.user);
-          } else {
-            localStorage.removeItem('authToken');
+            setLoading(false);
+            return;
           }
-        } else {
-          // Guest mode: generate random guest user
-          const guest = localStorage.getItem('guestUser');
-          if (guest) {
-            setUser(JSON.parse(guest));
-          } else {
-            const guestUser = {
-              id: 'guest-' + Math.random().toString(36).substring(2, 10),
-              username: 'Guest' + Math.floor(Math.random() * 10000),
-              isGuest: true,
-            };
-            localStorage.setItem('guestUser', JSON.stringify(guestUser));
-            setUser(guestUser);
-          }
+          localStorage.removeItem('authToken');
         }
+        setUser(createGuestUser());
       } catch (error) {
         console.error('Error getting initial session:', error);
-        // Fallback to guest mode
-        const guestUser = {
-          id: 'guest-' + Math.random().toString(36).substring(2, 10),
-          username: 'Guest' + Math.floor(Math.random() * 10000),
-          isGuest: true,
-        };
-        localStorage.setItem('guestUser', JSON.stringify(guestUser));
-        setUser(guestUser);
+        localStorage.removeItem('authToken');
+        setUser(createGuestUser());
       }
       setLoading(false);
     };
@@ -123,23 +121,25 @@ export function AuthProvider({ children }) {
     }
   };
 
-  const logout = async () => {
+  const continueAsGuest = () => {
     localStorage.removeItem('authToken');
-    setUser(null);
-    // Optionally, re-enable guest mode
-    const guestUser = {
-      id: 'guest-' + Math.random().toString(36).substring(2, 10),
-      username: 'Guest' + Math.floor(Math.random() * 10000),
-      isGuest: true,
-    };
-    localStorage.setItem('guestUser', JSON.stringify(guestUser));
-    setUser(guestUser);
+    setUser(createGuestUser());
   };
 
-  const isAuthenticated = user && !user.isGuest;
+  const logout = async () => {
+    localStorage.removeItem('authToken');
+    setUser(createGuestUser());
+  };
+
+  const isAuthenticated = Boolean(user && !user.isGuest);
+  // authUser = registered account only (null for guests)
+  // user = whoever is using the app right now (guest OR registered)
+  const authUser = isAuthenticated ? user : null;
 
   return (
-    <AuthContext.Provider value={{ user, isAuthenticated, loading, login, signup, logout }}>
+    <AuthContext.Provider
+      value={{ user, authUser, isAuthenticated, loading, login, signup, logout, continueAsGuest }}
+    >
       {children}
     </AuthContext.Provider>
   );

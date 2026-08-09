@@ -158,6 +158,10 @@
   position: relative;
 }
 
+.password-input-container .form-input {
+  padding-right: 3.25rem;
+}
+
 .password-toggle {
   position: absolute;
   right: var(--space-md);

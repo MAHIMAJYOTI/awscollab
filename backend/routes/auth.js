@@ -1,7 +1,18 @@
 const express = require('express');
+const crypto = require('crypto');
 const router = express.Router();
 const User = require('../models/User');
 
+const RESET_TOKEN_TTL_MS = 60 * 60 * 1000;
+
+const getFrontendUrl = () =>
+  (process.env.FRONTEND_URL || 'http://localhost:3000').replace(/\/$/, '');
+
+const isDevMode = () =>
+  process.env.NODE_ENV === 'development' || process.env.USE_LOCAL_STORE === 'true';
+
+const genericResetMessage =
+  'If this email is registered, you will receive a password reset link shortly.';
 // Register a new user
 router.post('/register', async (req, res) => {
   try {
@@ -53,7 +64,7 @@ router.post('/register', async (req, res) => {
     const user = new User({
       email: email.toLowerCase().trim(),
       username: username.trim(),
-      password: password // In production, hash this with bcrypt
+      password: password
     });
 
     await user.save();
@@ -117,7 +128,7 @@ router.post('/login', async (req, res) => {
     }
 
     // Validate password
-    if (!user.validatePassword(password)) {
+    if (!(await user.validatePassword(password))) {
       return res.status(401).json({
         success: false,
         message: 'Invalid email or password'
@@ -302,7 +313,7 @@ router.put('/change-password', async (req, res) => {
     }
 
     // Validate current password
-    if (!user.validatePassword(currentPassword)) {
+    if (!(await user.validatePassword(currentPassword))) {
       return res.status(401).json({
         success: false,
         message: 'Current password is incorrect'
@@ -322,6 +333,121 @@ router.put('/change-password', async (req, res) => {
     res.status(500).json({
       success: false,
       message: 'Failed to change password'
+    });
+  }
+});
+
+// Request password reset
+router.post('/forgot-password', async (req, res) => {
+  try {
+    const { email } = req.body;
+
+    if (!email) {
+      return res.status(400).json({
+        success: false,
+        message: 'Email is required',
+      });
+    }
+
+    const normalizedEmail = email.toLowerCase().trim();
+    const user = await User.findByEmail(normalizedEmail);
+    let devResetUrl;
+
+    if (user) {
+      const resetToken = crypto.randomBytes(32).toString('hex');
+      const resetTokenExpires = new Date(Date.now() + RESET_TOKEN_TTL_MS).toISOString();
+      await user.update({ resetToken, resetTokenExpires });
+
+      devResetUrl = `${getFrontendUrl()}/reset-password?token=${resetToken}`;
+      console.log(`Password reset requested for ${normalizedEmail}`);
+      if (isDevMode()) {
+        console.log(`Dev reset link: ${devResetUrl}`);
+      }
+      // Production: send devResetUrl via SES/SMTP here
+    }
+
+    const response = {
+      success: true,
+      message: genericResetMessage,
+    };
+
+    if (isDevMode() && devResetUrl) {
+      response.devResetUrl = devResetUrl;
+    }
+
+    res.json(response);
+  } catch (error) {
+    console.error('Forgot password error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Unable to process password reset. Please try again.',
+    });
+  }
+});
+
+// Validate reset token
+router.get('/reset-password/:token', async (req, res) => {
+  try {
+    const user = await User.findByResetToken(req.params.token);
+    if (!user || !user.isResetTokenValid()) {
+      return res.status(400).json({
+        success: false,
+        message: 'Invalid or expired reset link. Request a new one.',
+      });
+    }
+
+    res.json({ success: true, message: 'Reset link is valid' });
+  } catch (error) {
+    console.error('Validate reset token error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Unable to validate reset link.',
+    });
+  }
+});
+
+// Complete password reset
+router.post('/reset-password', async (req, res) => {
+  try {
+    const { token, newPassword } = req.body;
+
+    if (!token || !newPassword) {
+      return res.status(400).json({
+        success: false,
+        message: 'Reset token and new password are required',
+      });
+    }
+
+    if (newPassword.length < 6) {
+      return res.status(400).json({
+        success: false,
+        message: 'Password must be at least 6 characters long',
+      });
+    }
+
+    const user = await User.findByResetToken(token);
+    if (!user || !user.isResetTokenValid()) {
+      return res.status(400).json({
+        success: false,
+        message: 'Invalid or expired reset link. Request a new one.',
+      });
+    }
+
+    await user.update({
+      password: newPassword,
+      resetToken: null,
+      resetTokenExpires: null,
+    });
+
+    res.json({
+      success: true,
+      message: 'Password reset successfully. You can log in with your new password.',
+    });
+  } catch (error) {
+    console.error('Reset password error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Unable to reset password. Please try again.',
     });
   }
 });

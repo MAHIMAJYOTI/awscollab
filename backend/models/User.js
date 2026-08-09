@@ -1,8 +1,14 @@
-const { v4: uuidv4 } = require('uuid');
+const crypto = require('crypto');
+const bcrypt = require('bcrypt');
+
+const BCRYPT_ROUNDS = 10;
+
+const isBcryptHash = (value) =>
+  typeof value === 'string' && /^\$2[aby]\$/.test(value);
 
 class User {
   constructor(data) {
-    this.userId = data.userId || uuidv4();
+    this.userId = data.userId || crypto.randomUUID();
     this.email = data.email;
     this.username = data.username;
     this.password = data.password; // In production, this should be hashed
@@ -10,6 +16,8 @@ class User {
     this.updatedAt = data.updatedAt || new Date().toISOString();
     this.isActive = data.isActive !== undefined ? data.isActive : true;
     this.lastLogin = data.lastLogin;
+    this.resetToken = data.resetToken || null;
+    this.resetTokenExpires = data.resetTokenExpires || null;
     this.profile = data.profile || {
       firstName: '',
       lastName: '',
@@ -21,6 +29,10 @@ class User {
   // Save user to DynamoDB
   async save() {
     const { dynamodb } = require('../config/dynamodb');
+
+    if (this.password && !isBcryptHash(this.password)) {
+      this.password = await bcrypt.hash(this.password, BCRYPT_ROUNDS);
+    }
     
     const params = {
       TableName: 'Users',
@@ -28,7 +40,7 @@ class User {
         userId: this.userId,
         email: this.email,
         username: this.username,
-        password: this.password, // In production, hash this
+        password: this.password,
         createdAt: this.createdAt,
         updatedAt: this.updatedAt,
         isActive: this.isActive,
@@ -90,6 +102,34 @@ class User {
     }
   }
 
+  // Find user by password reset token
+  static async findByResetToken(resetToken) {
+    const { dynamodb } = require('../config/dynamodb');
+
+    const params = {
+      TableName: 'Users',
+      FilterExpression: 'resetToken = :resetToken',
+      ExpressionAttributeValues: {
+        ':resetToken': resetToken,
+      },
+    };
+
+    try {
+      const result = await dynamodb.scan(params).promise();
+      return result.Items.length > 0 ? new User(result.Items[0]) : null;
+    } catch (error) {
+      console.error('Error finding user by reset token:', error);
+      throw error;
+    }
+  }
+
+  isResetTokenValid() {
+    if (!this.resetToken || !this.resetTokenExpires) {
+      return false;
+    }
+    return new Date(this.resetTokenExpires).getTime() > Date.now();
+  }
+
   // Find user by ID
   static async findById(userId) {
     const { dynamodb } = require('../config/dynamodb');
@@ -117,6 +157,10 @@ class User {
     const updateExpressions = [];
     const expressionAttributeNames = {};
     const expressionAttributeValues = {};
+
+    if (updateData.password && !isBcryptHash(updateData.password)) {
+      updateData.password = await bcrypt.hash(updateData.password, BCRYPT_ROUNDS);
+    }
 
     Object.keys(updateData).forEach(key => {
       if (key !== 'userId' && updateData[key] !== undefined) {
@@ -175,12 +219,28 @@ class User {
   toJSON() {
     const userObj = { ...this };
     delete userObj.password;
+    delete userObj.resetToken;
+    delete userObj.resetTokenExpires;
     return userObj;
   }
 
-  // Validate password (simple comparison for now - should use bcrypt in production)
-  validatePassword(password) {
-    return this.password === password;
+  async validatePassword(password) {
+    if (!this.password || !password) {
+      return false;
+    }
+
+    if (isBcryptHash(this.password)) {
+      return bcrypt.compare(password, this.password);
+    }
+
+    // Legacy plain-text passwords: verify then upgrade hash on login
+    if (this.password === password) {
+      this.password = await bcrypt.hash(password, BCRYPT_ROUNDS);
+      await this.update({ password: this.password });
+      return true;
+    }
+
+    return false;
   }
 
   // Update last login

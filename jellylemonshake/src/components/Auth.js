@@ -1,6 +1,7 @@
 import React, { useState } from "react";
 import { Link, useNavigate } from "react-router-dom";
 import { useAuth } from "./AuthContext";
+import { PasswordInput } from "./PasswordInput";
 import "../styles/components/Auth.css";
 
 export const Login = () => {
@@ -9,8 +10,14 @@ export const Login = () => {
   const [error, setError] = useState("");
   const [isLoading, setIsLoading] = useState(false);
 
-  const { login } = useAuth();
+  const { login, continueAsGuest } = useAuth();
   const navigate = useNavigate();
+
+  const handleGuest = (e) => {
+    e.preventDefault();
+    continueAsGuest();
+    navigate('/');
+  };
 
   const handleSubmit = async (e) => {
     e.preventDefault();
@@ -64,14 +71,13 @@ export const Login = () => {
 
           <div className="form-group">
             <label htmlFor="password" className="form-label">Password</label>
-            <input
-              type="password"
+            <PasswordInput
               id="password"
-              className="form-input"
               value={password}
               onChange={(e) => setPassword(e.target.value)}
               placeholder="Enter your password"
               required
+              autoComplete="current-password"
             />
           </div>
 
@@ -89,9 +95,9 @@ export const Login = () => {
         </div>
 
         <div className="auth-guest">
-          <Link to="/" className="guest-link">
+          <button type="button" onClick={handleGuest} className="guest-link">
             Continue as Guest
-          </Link>
+          </button>
         </div>
       </div>
     </div>
@@ -107,8 +113,14 @@ export const Register = () => {
   const [isLoading, setIsLoading] = useState(false);
   const [verificationSent, setVerificationSent] = useState(false);
 
-  const { signup } = useAuth();
+  const { signup, continueAsGuest } = useAuth();
   const navigate = useNavigate();
+
+  const handleGuest = (e) => {
+    e.preventDefault();
+    continueAsGuest();
+    navigate('/');
+  };
 
   const handleSubmit = async (e) => {
     e.preventDefault();
@@ -219,26 +231,24 @@ export const Register = () => {
 
           <div className="form-group">
             <label htmlFor="password" className="form-label">Password</label>
-            <input
-              type="password"
+            <PasswordInput
               id="password"
-              className="form-input"
               value={password}
               onChange={(e) => setPassword(e.target.value)}
               placeholder="Create a password"
               required
+              autoComplete="new-password"
             />
           </div>
           <div className="form-group">
             <label htmlFor="confirm-password" className="form-label">Confirm Password</label>
-            <input
-              type="password"
+            <PasswordInput
               id="confirm-password"
-              className="form-input"
               value={confirmPassword}
               onChange={(e) => setConfirmPassword(e.target.value)}
               placeholder="Confirm your password"
               required
+              autoComplete="new-password"
             />
           </div>
           <button type="submit" className="auth-submit" disabled={isLoading}>
@@ -253,9 +263,9 @@ export const Register = () => {
         </div>
 
         <div className="auth-guest">
-          <Link to="/" className="guest-link">
+          <button type="button" onClick={handleGuest} className="guest-link">
             Continue as Guest
-          </Link>
+          </button>
         </div>
       </div>
     </div>
