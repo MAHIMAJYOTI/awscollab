@@ -1,14 +1,20 @@
 const AWS = require('aws-sdk');
-require('dotenv').config();
+const { configureAws } = require('./awsClient');
 
-// Configure AWS SDK
-AWS.config.update({
-  region: process.env.AWS_REGION || 'us-east-1',
-  accessKeyId: process.env.AWS_ACCESS_KEY_ID,
-  secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY
-});
+configureAws();
 
 const dynamodb = new AWS.DynamoDB();
+
+function toOnDemandTable(table) {
+  const { ProvisionedThroughput, GlobalSecondaryIndexes, ...rest } = table;
+  const out = { ...rest, BillingMode: 'PAY_PER_REQUEST' };
+  if (GlobalSecondaryIndexes) {
+    out.GlobalSecondaryIndexes = GlobalSecondaryIndexes.map(
+      ({ ProvisionedThroughput: _removed, ...gsi }) => gsi
+    );
+  }
+  return out;
+}
 
 // Table definitions
 const tables = [
@@ -274,21 +280,20 @@ async function createTables() {
   console.log('Creating DynamoDB tables...');
   
   for (const table of tables) {
+    const params = toOnDemandTable(table);
     try {
-      console.log(`Creating table: ${table.TableName}`);
-      await dynamodb.createTable(table).promise();
-      console.log(`✅ Table ${table.TableName} created successfully`);
-      
-      // Wait for table to be active
-      console.log(`Waiting for table ${table.TableName} to be active...`);
-      await dynamodb.waitFor('tableExists', { TableName: table.TableName }).promise();
-      console.log(`✅ Table ${table.TableName} is now active`);
-      
+      console.log(`Creating table: ${params.TableName} (on-demand billing)`);
+      await dynamodb.createTable(params).promise();
+      console.log(`✅ Table ${params.TableName} created successfully`);
+
+      console.log(`Waiting for table ${params.TableName} to be active...`);
+      await dynamodb.waitFor('tableExists', { TableName: params.TableName }).promise();
+      console.log(`✅ Table ${params.TableName} is now active`);
     } catch (error) {
       if (error.code === 'ResourceInUseException') {
-        console.log(`⚠️  Table ${table.TableName} already exists`);
+        console.log(`⚠️  Table ${params.TableName} already exists`);
       } else {
-        console.error(`❌ Error creating table ${table.TableName}:`, error.message);
+        console.error(`❌ Error creating table ${params.TableName}:`, error.message);
       }
     }
   }

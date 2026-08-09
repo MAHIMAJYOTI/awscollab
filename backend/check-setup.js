@@ -3,6 +3,24 @@
 const AWS = require('aws-sdk');
 require('dotenv').config();
 
+const useLocalStore = process.env.USE_LOCAL_STORE === 'true';
+
+console.log('🚀 AWS DynamoDB Setup Helper\n');
+
+if (useLocalStore) {
+  console.log('📦 USE_LOCAL_STORE=true — running with local JSON storage.');
+  console.log('   No AWS connection needed for local development.\n');
+  console.log('When you are ready for real AWS DynamoDB:');
+  console.log('  1. Add AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY to backend/.env');
+  console.log('  2. Set USE_LOCAL_STORE=false');
+  console.log('  3. npm run create-tables');
+  console.log('  4. npm run migrate-to-aws   (optional — copies local data)');
+  console.log('  5. npm run check-setup');
+  console.log('  6. Restart backend\n');
+  console.log('Check status anytime: GET http://localhost:5000/api/setup/status');
+  process.exit(0);
+}
+
 // Configure AWS SDK
 AWS.config.update({
   region: process.env.AWS_REGION || 'us-east-1',
@@ -11,8 +29,6 @@ AWS.config.update({
 });
 
 const dynamodb = new AWS.DynamoDB();
-
-console.log('🚀 AWS DynamoDB Setup Helper\n');
 
 // Check if AWS credentials are configured
 function checkCredentials() {
@@ -49,7 +65,7 @@ async function listTables() {
 
 // Check if required tables exist
 function checkRequiredTables(existingTables) {
-  const requiredTables = ['ChatRooms', 'Messages', 'Meetings', 'Projects'];
+  const requiredTables = ['ChatRooms', 'Messages', 'Meetings', 'Users', 'Projects', 'ProjectFiles'];
   const missingTables = requiredTables.filter(table => !existingTables.includes(table));
   
   console.log('\n🔍 Checking required tables:');
