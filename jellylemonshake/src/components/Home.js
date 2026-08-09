@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useRef } from "react";
 import { useNavigate, Link } from "react-router-dom";
 import { useAuth } from "./AuthContext";
+import { getApiUrl } from "../config";
 import "../styles/components/Home.css";
 
 function Home() {
@@ -9,11 +10,15 @@ function Home() {
   const [password, setPassword] = useState("");
   const [roomsExpanded, setRoomsExpanded] = useState(false);
   const myRoomsRef = useRef(null);
-  const { user, authUser } = useAuth();
+  const { user, authUser, isAuthenticated } = useAuth();
 
   // Helper function to get user identifier consistently
   const getUserIdentifier = () => {
-    return authUser?.email || authUser?.username || user?.email || user?.username || username || 'Anonymous';
+    if (authUser?.username) return authUser.username;
+    if (authUser?.email) return authUser.email;
+    if (user?.username && !user?.isGuest) return user.username;
+    if (user?.email && !user?.isGuest) return user.email;
+    return username.trim() || 'Anonymous';
   };
   const [view, setView] = useState("select");
   const [showRoomsList, setShowRoomsList] = useState(false);
@@ -42,17 +47,22 @@ function Home() {
     );
   };
 
-  // Load joined rooms on component mount
+  // Load joined rooms + auto-fill display name from account or saved preference
   useEffect(() => {
     const userRooms = JSON.parse(localStorage.getItem("joinedRooms") || "[]");
     setJoinedRooms(userRooms);
 
-    // If user has a stored username, use it
-    const savedUsername = localStorage.getItem("preferredUsername");
-    if (savedUsername) {
-      setUsername(savedUsername);
+    if (isAuthenticated && user?.username) {
+      setUsername(user.username);
+    } else if (isAuthenticated && user?.email) {
+      setUsername(user.email.split("@")[0]);
+    } else {
+      const savedUsername = localStorage.getItem("preferredUsername");
+      if (savedUsername) {
+        setUsername(savedUsername);
+      }
     }
-  }, []);
+  }, [isAuthenticated, user]);
   // Add useEffect for outside click detection
   useEffect(() => {
     function handleClickOutside(event) {
@@ -75,16 +85,28 @@ function Home() {
   }, [roomsExpanded]);
 /*sohamghosh-jellylemonshake-23bps1146 */
   // Function to handle room creation
+  const resolveDisplayName = () => {
+    if (isAuthenticated && authUser?.username) return authUser.username;
+    if (isAuthenticated && authUser?.email) return authUser.email.split('@')[0];
+    return (
+      username.trim() ||
+      user?.username ||
+      ''
+    );
+  };
+
   const handleCreateRoom = async (e) => {
     e.preventDefault();
-    if (!username.trim()) {
+    const displayName = resolveDisplayName();
+    if (!displayName) {
       setError("Username is required");
       return;
     }
 
     try {
       // Save preferred username
-      localStorage.setItem("preferredUsername", username);
+      localStorage.setItem("preferredUsername", displayName);
+      setUsername(displayName);
 
       // Generate a random 4-digit PIN
       const pin = Math.floor(1000 + Math.random() * 9000).toString();
@@ -109,7 +131,7 @@ function Home() {
       };
 
       // Create room on backend
-      const apiUrl = process.env.REACT_APP_API_URL || 'http://localhost:5000';
+      const apiUrl = getApiUrl();
       const response = await fetch(`${apiUrl}/api/rooms`, {
         method: 'POST',
         headers: {
@@ -161,7 +183,7 @@ function Home() {
         localStorage.setItem(
           "chatUser",
           JSON.stringify({
-            username,
+            username: userIdentifier,
             roomId: pin,
             joinedAt: new Date().toISOString(),
             color: userColor,
@@ -231,7 +253,8 @@ function Home() {
   // Function to handle joining a room
   const handleJoinRoom = async (e) => {
     e.preventDefault();
-    if (!username.trim()) {
+    const displayName = resolveDisplayName();
+    if (!displayName) {
       setError("Username is required");
       return;
     }
@@ -243,10 +266,11 @@ function Home() {
 
     try {
       // Save preferred username
-      localStorage.setItem("preferredUsername", username);
+      localStorage.setItem("preferredUsername", displayName);
+      setUsername(displayName);
 
       // Check backend first for room
-      const apiUrl = process.env.REACT_APP_API_URL || 'http://localhost:5000';
+      const apiUrl = getApiUrl();
       let room = null;
       const userColor = generateRandomColor();
 
@@ -414,7 +438,7 @@ function Home() {
 
   // Handle entering a joined room
   const enterRoom = (roomId) => {
-    // Get user data to preserve color
+    const userIdentifier = getUserIdentifier();
     const userData = JSON.parse(localStorage.getItem("chatUser") || "{}");
 
     // Get room data
@@ -442,10 +466,10 @@ function Home() {
     localStorage.setItem(
       "chatUser",
       JSON.stringify({
-        username,
+        username: userIdentifier,
         roomId,
         joinedAt: new Date().toISOString(),
-        color: userColor, // Include user's color
+        color: userColor,
       })
     );
 
@@ -627,8 +651,14 @@ function Home() {
             className="form-input"
             onChange={(e) => setUsername(e.target.value)}
             placeholder="Enter your display name"
+            readOnly={isAuthenticated}
             required
           />
+          {isAuthenticated && (
+            <p className="form-hint" style={{ fontSize: '0.85rem', color: '#666', marginTop: '4px' }}>
+              Using your account name ({authUser?.username || authUser?.email})
+            </p>
+          )}
         </div>
 
         <div className="toggle-container">
@@ -713,8 +743,14 @@ function Home() {
             className="form-input"
             onChange={(e) => setUsername(e.target.value)}
             placeholder="Enter your display name"
+            readOnly={isAuthenticated}
             required
           />
+          {isAuthenticated && (
+            <p className="form-hint" style={{ fontSize: '0.85rem', color: '#666', marginTop: '4px' }}>
+              Using your account name ({authUser?.username || authUser?.email})
+            </p>
+          )}
         </div>
 
         <div className="form-group">

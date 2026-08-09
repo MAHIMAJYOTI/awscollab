@@ -1,21 +1,34 @@
 // api.js
 import { getApiUrl } from '../config';
 
+export { getApiUrl };
 export const API_BASE_URL = getApiUrl();
+
+async function parseJsonResponse(response) {
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    return {
+      success: false,
+      message: data.message || `Request failed (${response.status})`,
+      ...data,
+    };
+  }
+  return data;
+}
 
 // Real API functions that call your backend
 export const api = {
   // Auth
   login: async (credentials) => {
     try {
-      const response = await fetch(`${API_BASE_URL}/api/auth/login`, {
+      const response = await fetch(`${getApiUrl()}/api/auth/login`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
         },
         body: JSON.stringify(credentials),
       });
-      return await response.json();
+      return await parseJsonResponse(response);
     } catch (error) {
       console.error('Error logging in:', error);
       return { success: false, message: 'Failed to connect to server' };
@@ -24,14 +37,14 @@ export const api = {
 
   register: async (userData) => {
     try {
-      const response = await fetch(`${API_BASE_URL}/api/auth/register`, {
+      const response = await fetch(`${getApiUrl()}/api/auth/register`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
         },
         body: JSON.stringify(userData),
       });
-      return await response.json();
+      return await parseJsonResponse(response);
     } catch (error) {
       console.error('Error registering:', error);
       return { success: false, message: 'Failed to connect to server' };
@@ -46,14 +59,14 @@ export const api = {
         return { success: false, message: 'No authentication token' };
       }
 
-      const response = await fetch(`${API_BASE_URL}/api/auth/profile`, {
+      const response = await fetch(`${getApiUrl()}/api/auth/profile`, {
         method: 'GET',
         headers: {
           'Content-Type': 'application/json',
           'Authorization': `Bearer ${token}`,
         },
       });
-      return await response.json();
+      return await parseJsonResponse(response);
     } catch (error) {
       console.error('Error fetching current user:', error);
       return { success: false, message: 'Failed to fetch user profile' };
@@ -101,6 +114,44 @@ export const api = {
     } catch (error) {
       console.error('Error changing password:', error);
       return { success: false, message: 'Failed to change password' };
+    }
+  },
+
+  forgotPassword: async (email) => {
+    try {
+      const response = await fetch(`${getApiUrl()}/api/auth/forgot-password`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email }),
+      });
+      return await parseJsonResponse(response);
+    } catch (error) {
+      console.error('Error requesting password reset:', error);
+      return { success: false, message: 'Failed to connect to server' };
+    }
+  },
+
+  validateResetToken: async (token) => {
+    try {
+      const response = await fetch(`${getApiUrl()}/api/auth/reset-password/${token}`);
+      return await parseJsonResponse(response);
+    } catch (error) {
+      console.error('Error validating reset token:', error);
+      return { success: false, message: 'Failed to connect to server' };
+    }
+  },
+
+  resetPassword: async ({ token, newPassword }) => {
+    try {
+      const response = await fetch(`${getApiUrl()}/api/auth/reset-password`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ token, newPassword }),
+      });
+      return await parseJsonResponse(response);
+    } catch (error) {
+      console.error('Error resetting password:', error);
+      return { success: false, message: 'Failed to connect to server' };
     }
   },
 
@@ -412,7 +463,7 @@ export const api = {
         },
         body: JSON.stringify(codeData),
       });
-      return await response.json();
+      return await parseJsonResponse(response);
     } catch (error) {
       console.error('Error executing code:', error);
       return { success: false, message: 'Failed to execute code', error: error.message };

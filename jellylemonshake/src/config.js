@@ -1,11 +1,18 @@
 // Configuration file for the application
 // This centralizes all configuration values
 
+const DEFAULT_API_URL = 'http://localhost:5000';
+
+const trimTrailingSlash = (url) => url.replace(/\/$/, '');
+
 /**
- * Get API base URL from environment or use default
+ * Get API base URL from environment or use default (localhost until deploy)
  */
 export const getApiUrl = () => {
-  return process.env.REACT_APP_API_URL || 'https://awsproject-backend-prod.eba-fphuu5yq.us-east-1.elasticbeanstalk.com';
+  if (process.env.REACT_APP_API_URL) {
+    return trimTrailingSlash(process.env.REACT_APP_API_URL);
+  }
+  return trimTrailingSlash(DEFAULT_API_URL);
 };
 
 /**

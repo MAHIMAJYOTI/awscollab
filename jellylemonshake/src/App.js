@@ -22,6 +22,7 @@ const NotFound = lazy(() => import("./components/NotFound"));
 const UserProfile = lazy(() => import("./components/UserProfile"));
 const Navbar = lazy(() => import("./components/Navbar"));
 const ForgotPassword = lazy(() => import("./components/ForgotPassword"));
+const ResetPassword = lazy(() => import("./components/ResetPassword"));
 
 // Auth components
 const Auth = lazy(() => import("./components/Auth"));
@@ -137,6 +138,24 @@ function AnimatedRoutes() {
                 <div className="content-container">
                   <Suspense fallback={<div className="loading">Loading...</div>}>
                     <ForgotPassword />
+                  </Suspense>
+                </div>
+              </AnimatedPage>
+            </>
+          }
+        />
+
+        <Route
+          path="/reset-password"
+          element={
+            <>
+              <Suspense fallback={<div className="loading">Loading...</div>}>
+                <Navbar />
+              </Suspense>
+              <AnimatedPage>
+                <div className="content-container">
+                  <Suspense fallback={<div className="loading">Loading...</div>}>
+                    <ResetPassword />
                   </Suspense>
                 </div>
               </AnimatedPage>
