@@ -3,10 +3,57 @@ import { useAuth } from './AuthContext';
 import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter';
 import { tomorrow } from 'react-syntax-highlighter/dist/esm/styles/prism';
 import socketService from '../services/socketService';
+import { getApiUrl } from '../config';
 import '../styles/components/CollaborativeEditor.css';
 
+const getUserId = (u) => {
+  if (u && !u.isGuest) {
+    if (u.username) return u.username;
+    if (u.email) return u.email;
+  }
+  return u?.email || u?.username || u?.id || 'anonymous';
+};
+const getFileId = (f) => f?.fileId || f?._id || f?.id;
+
+const getFileTypeFromName = (fileName) => {
+  const ext = (fileName || '').split('.').pop()?.toLowerCase();
+  const map = {
+    js: 'javascript',
+    jsx: 'jsx',
+    ts: 'typescript',
+    tsx: 'tsx',
+    css: 'css',
+    html: 'html',
+    htm: 'html',
+    json: 'json',
+    md: 'other',
+    txt: 'other',
+  };
+  return map[ext] || 'other';
+};
+
+const normalizeParticipant = (p) => {
+  if (typeof p === 'string') {
+    return { username: p, email: p };
+  }
+  return {
+    username: p?.username || p?.email || 'member',
+    email: p?.email || p?.username || 'member',
+  };
+};
+
+const downloadBlob = (filename, content, mimeType = 'text/plain;charset=utf-8') => {
+  const blob = new Blob([content], { type: mimeType });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement('a');
+  link.href = url;
+  link.download = filename;
+  link.click();
+  URL.revokeObjectURL(url);
+};
+
 function CollaborativeEditor({ roomId, onClose, participants = [] }) {
-  const { user, isAuthenticated } = useAuth();
+  const { user } = useAuth();
   const [projects, setProjects] = useState([]);
   const [selectedProject, setSelectedProject] = useState(null);
   const [files, setFiles] = useState([]);
@@ -17,6 +64,11 @@ function CollaborativeEditor({ roomId, onClose, participants = [] }) {
   const [success, setSuccess] = useState('');
   const [compilationStatus, setCompilationStatus] = useState('idle');
   const [previewUrl, setPreviewUrl] = useState('');
+  const [previewHtml, setPreviewHtml] = useState('');
+  const [showPreview, setShowPreview] = useState(false);
+  const previewUrlRef = useRef(null);
+  const [showNewProjectModal, setShowNewProjectModal] = useState(false);
+  const [newProjectName, setNewProjectName] = useState('');
   const [showCodePaste, setShowCodePaste] = useState(false);
   const [pastedCode, setPastedCode] = useState('');
   const [selectedLanguage, setSelectedLanguage] = useState('nodejs');
@@ -35,6 +87,7 @@ function CollaborativeEditor({ roomId, onClose, participants = [] }) {
   const [lastSaved, setLastSaved] = useState(null);
   const [fileVersion, setFileVersion] = useState(0);
   const [hasConflicts, setHasConflicts] = useState(false);
+  const [socketConnected, setSocketConnected] = useState(false);
   
   const fileInputRef = useRef(null);
   const contentRef = useRef(null);
@@ -42,208 +95,215 @@ function CollaborativeEditor({ roomId, onClose, participants = [] }) {
   const typingTimeoutRef = useRef(null);
   const autoSaveTimeoutRef = useRef(null);
   const cursorUpdateTimeoutRef = useRef(null);
+  const newProjectInputRef = useRef(null);
+  const selectedProjectRef = useRef(null);
+  const selectedFileRef = useRef(null);
+  const userRef = useRef(null);
+  const autoSaveEnabledRef = useRef(autoSaveEnabled);
+
+  const setPreviewFromHtml = useCallback((html) => {
+    if (previewUrlRef.current?.startsWith('blob:')) {
+      URL.revokeObjectURL(previewUrlRef.current);
+    }
+    const blob = new Blob([html], { type: 'text/html;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    previewUrlRef.current = url;
+    setPreviewUrl(url);
+    setPreviewHtml(html);
+    setShowPreview(true);
+  }, []);
+
+  const closePreview = useCallback(() => {
+    if (previewUrlRef.current?.startsWith('blob:')) {
+      URL.revokeObjectURL(previewUrlRef.current);
+    }
+    previewUrlRef.current = null;
+    setPreviewUrl('');
+    setPreviewHtml('');
+    setShowPreview(false);
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      if (previewUrlRef.current?.startsWith('blob:')) {
+        URL.revokeObjectURL(previewUrlRef.current);
+      }
+    };
+  }, []);
+
+  useEffect(() => {
+    selectedProjectRef.current = selectedProject;
+    selectedFileRef.current = selectedFile;
+    userRef.current = user;
+    autoSaveEnabledRef.current = autoSaveEnabled;
+  }, [selectedProject, selectedFile, user, autoSaveEnabled]);
 
   useEffect(() => {
     if (roomId) {
       loadProjects();
-      setupCollaborativeEditing();
     }
-    
-    // Clean up when editor is closed
-    return () => {
-      cleanupCollaborativeEditing();
-    };
   }, [roomId]);
 
-  // Setup collaborative editing WebSocket listeners
-  const setupCollaborativeEditing = useCallback(() => {
-    console.log('Setting up collaborative editing...');
-    console.log('Socket connected:', socketService.isConnected());
-    console.log('Room ID:', roomId);
-    console.log('User:', user);
-    
-    if (!socketService.isConnected()) {
-      console.log('Connecting to socket...');
-      socketService.connect();
-    }
+  useEffect(() => {
+    const unsubscribe = socketService.onConnectionChange(setSocketConnected);
+    return unsubscribe;
+  }, []);
 
-    // Add a small delay to ensure socket is connected
-    setTimeout(() => {
-      console.log('Socket connection status after delay:', socketService.isConnected());
-    }, 1000);
-
-    // Listen for file content updates from other users
-    socketService.onFileContentUpdated((data) => {
-      console.log('📥 Received file content update:', data);
-      console.log('Current project:', selectedProject?.projectId);
-      console.log('Current file:', selectedFile?._id);
-      console.log('Current user:', user?.email || user?.username);
-      console.log('Update from user:', data.userId);
-      
-      if (data.projectId === selectedProject?.projectId && 
-          data.fileId === selectedFile?._id && 
-          data.userId !== (user?.email || user?.username)) {
-        
-        console.log('✅ Processing file content update for current file from:', data.userId);
-        
-        // Simple conflict resolution: if local version is newer, show conflict warning
-        if (data.timestamp < Date.now() - 5000) { // 5 second tolerance
-          setHasConflicts(true);
-          console.warn('Potential conflict detected with remote changes');
-        }
-        
-        setFileContent(data.content);
-        setLastSaved(new Date());
-        setFileVersion(prev => prev + 1);
-      } else {
-        console.log('❌ Ignoring file content update (not matching project/file or from self)');
-      }
-    });
-
-    // Listen for cursor position updates
-    socketService.onUserCursorUpdated((data) => {
-      console.log('🎯 Received cursor update:', data);
-      console.log('Current project:', selectedProject?.projectId);
-      console.log('Current file:', selectedFile?._id);
-      console.log('Current user:', user?.email || user?.username);
-      console.log('Cursor from user:', data.userId);
-      
-      // Accept cursor updates if:
-      // 1. Same project and file (exact match)
-      // 2. Same project but no file selected (show cursor for any file in project)
-      // 3. No project selected but received project matches available projects
-      // 4. Different user (not from self)
-      const isSameProject = data.projectId === selectedProject?.projectId;
-      const isSameFile = data.fileId === (selectedFile?._id || selectedFile?.id || selectedFile?.fileId);
-      const isDifferentUser = data.userId !== (user?.email || user?.username);
-      
-      // Check if the received project ID matches any available project
-      const hasMatchingProject = projects.some(project => project.projectId === data.projectId);
-      
-      // More permissive logic - accept cursor updates if:
-      // 1. Different user AND
-      // 2. Either same project/file OR no project selected but project exists in available projects
-      if (isDifferentUser && (
-        (isSameProject && isSameFile) || 
-        (isSameProject && !selectedFile) ||
-        (!selectedProject && hasMatchingProject) ||
-        (!selectedProject && !selectedFile) // Accept any cursor if no project/file selected
-      )) {
-        console.log('✅ Processing cursor update for current file from:', data.userId);
-        setUserCursors(prev => {
-          const newCursors = new Map(prev);
-          newCursors.set(data.userId, {
-            position: data.position,
-            selection: data.selection,
-            timestamp: data.timestamp
-          });
-          console.log('Updated cursors:', newCursors);
-          return newCursors;
-        });
-      } else {
-        console.log('❌ Ignoring cursor update:', {
-          isDifferentUser,
-          isSameProject,
-          isSameFile,
-          hasSelectedFile: !!selectedFile,
-          hasSelectedProject: !!selectedProject,
-          hasMatchingProject,
-          reason: !isDifferentUser ? 'from self' : !isSameProject && !hasMatchingProject ? 'different project' : 'different file',
-          receivedProjectId: data.projectId,
-          currentProjectId: selectedProject?.projectId,
-          availableProjects: projects.map(p => p.projectId),
-          receivedData: data
-        });
-      }
-    });
-
-    // Listen for user selection updates
-    socketService.onUserSelectionUpdated((data) => {
-      if (data.projectId === selectedProject?.projectId && 
-          data.fileId === selectedFile?._id && 
-          data.userId !== user?.email) {
-        setEditingUsers(prev => {
-          const newUsers = new Map(prev);
-          newUsers.set(data.userId, {
-            selection: data.selection,
-            color: data.color,
-            timestamp: data.timestamp
-          });
-          return newUsers;
-        });
-      }
-    });
-
-    // Listen for users editing files
-    socketService.onUserEditingFile((data) => {
-      if (data.projectId === selectedProject?.projectId && 
-          data.fileId === selectedFile?._id && 
-          data.userId !== user?.email) {
-        console.log(`User ${data.userId} is editing file ${data.fileId}`);
-      }
-    });
-
-    // Listen for users stopping file editing
-    socketService.onUserStoppedEditingFile((data) => {
-      if (data.projectId === selectedProject?.projectId && 
-          data.fileId === selectedFile?._id && 
-          data.userId !== user?.email) {
-        setUserCursors(prev => {
-          const newCursors = new Map(prev);
-          newCursors.delete(data.userId);
-          return newCursors;
-        });
-        setEditingUsers(prev => {
-          const newUsers = new Map(prev);
-          newUsers.delete(data.userId);
-          return newUsers;
-        });
-      }
-    });
-
-    // Listen for code typing indicators
-    socketService.onUserCodeTyping((data) => {
-      if (data.projectId === selectedProject?.projectId && 
-          data.fileId === selectedFile?._id && 
-          data.userId !== user?.email) {
-        setTypingUsers(prev => {
-          const newTyping = new Map(prev);
-          if (data.isTyping) {
-            newTyping.set(data.userId, {
-              timestamp: data.timestamp,
-              fileId: data.fileId
-            });
-          } else {
-            newTyping.delete(data.userId);
-          }
-          return newTyping;
-        });
-      }
-    });
-  }, [selectedProject, selectedFile, user]);
-
-  // Cleanup collaborative editing
-  const cleanupCollaborativeEditing = useCallback(() => {
-    if (selectedProject && selectedFile && user) {
-      socketService.leaveFileEdit({
-        roomId,
-        projectId: selectedProject.projectId,
-        fileId: selectedFile._id,
-        userId: user.email || user.username
+  const reconnectSocket = useCallback(() => {
+    socketService.connect();
+    if (roomId && user) {
+      socketService.joinRoom(roomId, {
+        username: getUserId(user),
+        email: user.email,
+        id: user.id,
       });
     }
-    
-    // Clear timeouts
-    if (typingTimeoutRef.current) {
-      clearTimeout(typingTimeoutRef.current);
-    }
-    if (autoSaveTimeoutRef.current) {
-      clearTimeout(autoSaveTimeoutRef.current);
-    }
-    if (cursorUpdateTimeoutRef.current) {
-      clearTimeout(cursorUpdateTimeoutRef.current);
-    }
-  }, [selectedProject, selectedFile, user, roomId]);
+    setSocketConnected(socketService.isConnected());
+  }, [roomId, user]);
+
+  useEffect(() => {
+    if (!roomId || !user) return;
+
+    reconnectSocket();
+
+    const onFileContentUpdated = (data) => {
+      const proj = selectedProjectRef.current;
+      const file = selectedFileRef.current;
+      const currentUser = userRef.current;
+      const fileId = getFileId(file);
+
+      if (
+        data.projectId === proj?.projectId &&
+        data.fileId === fileId &&
+        data.userId !== getUserId(currentUser)
+      ) {
+        setFileContent(data.content);
+        setLastSaved(new Date());
+        setFileVersion((prev) => prev + 1);
+      }
+    };
+
+    const onUserCursorUpdated = (data) => {
+      const proj = selectedProjectRef.current;
+      const file = selectedFileRef.current;
+      const currentUser = userRef.current;
+      const fileId = getFileId(file);
+
+      if (
+        data.projectId === proj?.projectId &&
+        data.fileId === fileId &&
+        data.userId !== getUserId(currentUser)
+      ) {
+        setUserCursors((prev) => {
+          const next = new Map(prev);
+          next.set(data.userId, {
+            position: data.position,
+            selection: data.selection,
+            timestamp: data.timestamp,
+          });
+          return next;
+        });
+      }
+    };
+
+    const onUserSelectionUpdated = (data) => {
+      const proj = selectedProjectRef.current;
+      const file = selectedFileRef.current;
+      const currentUser = userRef.current;
+
+      if (
+        data.projectId === proj?.projectId &&
+        data.fileId === getFileId(file) &&
+        data.userId !== getUserId(currentUser)
+      ) {
+        setEditingUsers((prev) => {
+          const next = new Map(prev);
+          next.set(data.userId, {
+            selection: data.selection,
+            color: data.color,
+            timestamp: data.timestamp,
+          });
+          return next;
+        });
+      }
+    };
+
+    const onUserStoppedEditingFile = (data) => {
+      const proj = selectedProjectRef.current;
+      const file = selectedFileRef.current;
+
+      if (
+        data.projectId === proj?.projectId &&
+        data.fileId === getFileId(file)
+      ) {
+        setUserCursors((prev) => {
+          const next = new Map(prev);
+          next.delete(data.userId);
+          return next;
+        });
+        setEditingUsers((prev) => {
+          const next = new Map(prev);
+          next.delete(data.userId);
+          return next;
+        });
+      }
+    };
+
+    const onUserCodeTyping = (data) => {
+      const proj = selectedProjectRef.current;
+      const file = selectedFileRef.current;
+      const currentUser = userRef.current;
+
+      if (
+        data.projectId === proj?.projectId &&
+        data.fileId === getFileId(file) &&
+        data.userId !== getUserId(currentUser)
+      ) {
+        setTypingUsers((prev) => {
+          const next = new Map(prev);
+          if (data.isTyping) {
+            next.set(data.userId, {
+              timestamp: data.timestamp,
+              fileId: data.fileId,
+            });
+          } else {
+            next.delete(data.userId);
+          }
+          return next;
+        });
+      }
+    };
+
+    socketService.onFileContentUpdated(onFileContentUpdated);
+    socketService.onUserCursorUpdated(onUserCursorUpdated);
+    socketService.onUserSelectionUpdated(onUserSelectionUpdated);
+    socketService.onUserStoppedEditingFile(onUserStoppedEditingFile);
+    socketService.onUserCodeTyping(onUserCodeTyping);
+
+    return () => {
+      socketService.off('file-content-updated', onFileContentUpdated);
+      socketService.off('user-cursor-updated', onUserCursorUpdated);
+      socketService.off('user-selection-updated', onUserSelectionUpdated);
+      socketService.off('user-stopped-editing-file', onUserStoppedEditingFile);
+      socketService.off('user-code-typing', onUserCodeTyping);
+
+      const proj = selectedProjectRef.current;
+      const file = selectedFileRef.current;
+      const currentUser = userRef.current;
+      if (proj && file && currentUser) {
+        socketService.leaveFileEdit({
+          roomId,
+          projectId: proj.projectId,
+          fileId: getFileId(file),
+          userId: getUserId(currentUser),
+        });
+      }
+
+      if (typingTimeoutRef.current) clearTimeout(typingTimeoutRef.current);
+      if (autoSaveTimeoutRef.current) clearTimeout(autoSaveTimeoutRef.current);
+      if (cursorUpdateTimeoutRef.current) clearTimeout(cursorUpdateTimeoutRef.current);
+    };
+  }, [roomId, user, reconnectSocket]);
 
   // Handle scroll events for scroll buttons
   useEffect(() => {
@@ -286,57 +346,83 @@ function CollaborativeEditor({ roomId, onClose, participants = [] }) {
   }, [selectedFile]);
 
   const loadProjects = async () => {
+    if (!roomId) return;
     try {
-      const apiUrl = process.env.REACT_APP_API_URL || 'http://localhost:5000';
+      const apiUrl = getApiUrl();
       const response = await fetch(`${apiUrl}/api/projects/room/${roomId}`);
       const data = await response.json();
-      
+
       if (data.success) {
-        setProjects(data.projects);
+        setProjects(data.projects || []);
+      } else {
+        setError(data.message || 'Failed to load projects');
       }
     } catch (err) {
       console.error('Error loading projects:', err);
+      setError('Cannot reach server. Is the backend running on port 5000?');
     }
   };
 
-  const createProject = async () => {
-    const projectName = prompt('Enter project name:');
-    if (!projectName) return;
+  const openNewProjectModal = () => {
+    setError('');
+    setSuccess('');
+    setNewProjectName('');
+    setShowNewProjectModal(true);
+    setTimeout(() => newProjectInputRef.current?.focus(), 50);
+  };
+
+  const createProject = async (e) => {
+    e?.preventDefault();
+    const projectName = newProjectName.trim();
+    if (!projectName) {
+      setError('Please enter a project name');
+      return;
+    }
+
+    if (!roomId) {
+      setError('Room ID is missing — rejoin the room and try again');
+      return;
+    }
 
     setLoading(true);
     setError('');
+    setSuccess('');
 
     try {
-      const apiUrl = process.env.REACT_APP_API_URL || 'http://localhost:5000';
+      const apiUrl = getApiUrl();
+      const roomMembers = (participants || []).map(normalizeParticipant);
+
       const response = await fetch(`${apiUrl}/api/projects/create`, {
         method: 'POST',
         headers: {
-          'Content-Type': 'application/json'
+          'Content-Type': 'application/json',
         },
         body: JSON.stringify({
           name: projectName,
           description: `Collaborative project for room ${roomId}`,
           roomId,
-          createdBy: user?.email || user?.username,
+          createdBy: getUserId(user),
           projectType: 'react',
-          roomMembers: participants.map(p => ({
-            username: p.username,
-            email: p.email || p.username
-          }))
-        })
+          roomMembers,
+        }),
       });
 
       const data = await response.json();
       if (data.success) {
-        setSuccess('Project created successfully!');
-        loadProjects();
+        setShowNewProjectModal(false);
+        setNewProjectName('');
+        setSuccess(`Project "${projectName}" created!`);
+        setProjects((prev) => [data.project, ...prev.filter((p) => p.projectId !== data.project.projectId)]);
         setSelectedProject(data.project);
-        loadProjectFiles(data.project.projectId);
+        setFiles([]);
+        setSelectedFile(null);
+        setFileContent('');
+        await loadProjectFiles(data.project.projectId);
       } else {
         setError(data.message || 'Failed to create project');
       }
     } catch (err) {
-      setError('Failed to create project');
+      setError('Failed to create project. Check that the backend is running.');
       console.error('Error creating project:', err);
     } finally {
       setLoading(false);
@@ -345,7 +431,7 @@ function CollaborativeEditor({ roomId, onClose, participants = [] }) {
 
   const loadProjectFiles = async (projectId) => {
     try {
-      const apiUrl = process.env.REACT_APP_API_URL || 'http://localhost:5000';
+      const apiUrl = getApiUrl();
       const response = await fetch(`${apiUrl}/api/projects/${projectId}`);
       const data = await response.json();
       
@@ -389,10 +475,10 @@ function CollaborativeEditor({ roomId, onClose, participants = [] }) {
     try {
       const formData = new FormData();
       formData.append('file', file);
-      formData.append('uploadedBy', user?.email || user?.username);
-      formData.append('lastModifiedBy', user?.email || user?.username);
+      formData.append('uploadedBy', getUserId(user));
+      formData.append('lastModifiedBy', getUserId(user));
 
-      const apiUrl = process.env.REACT_APP_API_URL || 'http://localhost:5000';
+      const apiUrl = getApiUrl();
       const response = await fetch(`${apiUrl}/api/projects/${selectedProject.projectId}/files/upload`, {
         method: 'POST',
         body: formData
@@ -488,7 +574,7 @@ function CollaborativeEditor({ roomId, onClose, participants = [] }) {
     setSuccess('');
 
     try {
-      const apiUrl = process.env.REACT_APP_API_URL || 'http://localhost:5000';
+      const apiUrl = getApiUrl();
       const response = await fetch(`${apiUrl}/api/projects/${selectedProject.projectId}/files/${fileId}`, {
         method: 'DELETE',
         headers: {
@@ -505,7 +591,7 @@ function CollaborativeEditor({ roomId, onClose, participants = [] }) {
         setSuccess('File deleted successfully!');
         loadProjectFiles(selectedProject.projectId);
         // Clear selection if deleted file was selected
-        if (selectedFile && selectedFile._id === fileId) {
+        if (selectedFile && getFileId(selectedFile) === fileId) {
           setSelectedFile(null);
           setFileContent('');
         }
@@ -531,15 +617,16 @@ function CollaborativeEditor({ roomId, onClose, participants = [] }) {
     setSuccess('');
 
     try {
-      const apiUrl = process.env.REACT_APP_API_URL || 'http://localhost:5000';
-      const response = await fetch(`${apiUrl}/api/projects/${selectedProject.projectId}/files/${selectedFile._id}`, {
+      const apiUrl = getApiUrl();
+      const fileId = getFileId(selectedFile);
+      const response = await fetch(`${apiUrl}/api/projects/${selectedProject.projectId}/files/${fileId}`, {
         method: 'PUT',
         headers: {
           'Content-Type': 'application/json'
         },
         body: JSON.stringify({
           content: fileContent,
-          lastModifiedBy: user?.email || user?.username
+          lastModifiedBy: getUserId(user)
         })
       });
 
@@ -550,6 +637,7 @@ function CollaborativeEditor({ roomId, onClose, participants = [] }) {
       const data = await response.json();
       if (data.success) {
         setSuccess('File saved successfully!');
+        setLastSaved(new Date());
         loadProjectFiles(selectedProject.projectId);
       } else {
         setError(data.message || 'Failed to save file');
@@ -575,18 +663,36 @@ function CollaborativeEditor({ roomId, onClose, participants = [] }) {
     return colors[Math.abs(hash) % colors.length];
   }, []);
 
-  // Debounced function to send file content changes
+  const persistFileContent = async (projectId, fileId, content) => {
+    try {
+      const apiUrl = getApiUrl();
+      await fetch(`${apiUrl}/api/projects/${projectId}/files/${fileId}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          content,
+          lastModifiedBy: getUserId(userRef.current),
+        }),
+      });
+      setLastSaved(new Date());
+    } catch (err) {
+      console.error('Auto-save failed:', err);
+    }
+  };
+
   const debouncedSendContentChange = useCallback((data) => {
     if (autoSaveTimeoutRef.current) {
       clearTimeout(autoSaveTimeoutRef.current);
     }
-    
+
     autoSaveTimeoutRef.current = setTimeout(() => {
       if (data && socketService.isConnected()) {
-        console.log('Sending debounced content change:', data);
         socketService.sendFileContentChange(data);
       }
-    }, 300); // 300ms debounce
+      if (autoSaveEnabledRef.current && data?.projectId && data?.fileId) {
+        persistFileContent(data.projectId, data.fileId, data.content);
+      }
+    }, 400);
   }, []);
 
   // Debounced function to send cursor position
@@ -603,7 +709,7 @@ function CollaborativeEditor({ roomId, onClose, participants = [] }) {
             roomId,
             projectId: selectedProject.projectId,
             fileId: fileId,
-            userId: user.email || user.username,
+            userId: getUserId(user),
             position,
             selection
           });
@@ -623,7 +729,7 @@ function CollaborativeEditor({ roomId, onClose, participants = [] }) {
             roomId,
             projectId: selectedProject.projectId,
             fileId: fileId,
-            userId: user.email || user.username,
+            userId: getUserId(user),
             isTyping: true
           });
         }
@@ -645,7 +751,7 @@ function CollaborativeEditor({ roomId, onClose, participants = [] }) {
             roomId,
             projectId: selectedProject.projectId,
             fileId: fileId,
-            userId: user.email || user.username,
+            userId: getUserId(user),
             isTyping: false
           });
         }
@@ -679,7 +785,7 @@ function CollaborativeEditor({ roomId, onClose, participants = [] }) {
         projectId: selectedProject.projectId,
         fileId: fileId,
         content: content,
-        userId: user.email || user.username,
+        userId: getUserId(user),
         timestamp: Date.now()
       });
     } else {
@@ -744,10 +850,10 @@ function CollaborativeEditor({ roomId, onClose, participants = [] }) {
       socketService.sendUserSelection({
         roomId,
         projectId: selectedProject.projectId,
-        fileId: selectedFile._id,
-        userId: user.email || user.username,
+        fileId: getFileId(selectedFile),
+        userId: getUserId(user),
         selection,
-        color: getUserColor(user.email || user.username)
+        color: getUserColor(getUserId(user))
       });
     }
   };
@@ -759,21 +865,23 @@ function CollaborativeEditor({ roomId, onClose, participants = [] }) {
     setError('');
 
     try {
-      const apiUrl = process.env.REACT_APP_API_URL || 'http://localhost:5000';
-      const response = await fetch(`${apiUrl}/api/projects/${selectedProject.projectId}/files/${selectedFile._id}`, {
+      const apiUrl = getApiUrl();
+      const fileId = getFileId(selectedFile);
+      const response = await fetch(`${apiUrl}/api/projects/${selectedProject.projectId}/files/${fileId}`, {
         method: 'PUT',
         headers: {
           'Content-Type': 'application/json'
         },
         body: JSON.stringify({
           content: fileContent,
-          lastModifiedBy: user?.email || user?.username
+          lastModifiedBy: getUserId(user)
         })
       });
 
       const data = await response.json();
       if (data.success) {
         setSuccess('File saved successfully!');
+        setLastSaved(new Date());
         loadProjectFiles(selectedProject.projectId);
       } else {
         setError(data.message || 'Failed to save file');
@@ -802,7 +910,7 @@ function CollaborativeEditor({ roomId, onClose, participants = [] }) {
     setSuccess('');
 
     try {
-      const apiUrl = process.env.REACT_APP_API_URL || 'http://localhost:5000';
+      const apiUrl = getApiUrl();
       const response = await fetch(`${apiUrl}/api/projects/${selectedProject.projectId}/compile`, {
         method: 'POST',
         headers: {
@@ -813,38 +921,24 @@ function CollaborativeEditor({ roomId, onClose, participants = [] }) {
         })
       });
 
-      if (!response.ok) {
-        throw new Error(`Compilation failed with status: ${response.status}`);
-      }
-      
       const data = await response.json();
 
-      if (data.success && data.compilation) {
+      if (!response.ok || !data.success) {
+        setCompilationStatus('error');
+        setError(data.compilation?.error || data.message || 'Compilation failed');
+        return;
+      }
+
+      if (data.compilation?.success && data.compilation.output) {
+        setPreviewFromHtml(data.compilation.output);
         setCompilationStatus('success');
-        
-        // Try to use the preview URL first
-        const fullPreviewUrl = `${apiUrl}${data.compilation.previewUrl}`;
-        
-        // Test if the preview URL is accessible
-        try {
-          const testResponse = await fetch(fullPreviewUrl, { method: 'HEAD' });
-          if (testResponse.ok) {
-            setPreviewUrl(fullPreviewUrl);
-          } else {
-            // Fallback to data URL
-            const dataUrl = `data:text/html;charset=utf-8,${encodeURIComponent(data.compilation.output)}`;
-            setPreviewUrl(dataUrl);
-          }
-        } catch (urlError) {
-          // Fallback to data URL if preview URL fails
-          const dataUrl = `data:text/html;charset=utf-8,${encodeURIComponent(data.compilation.output)}`;
-          setPreviewUrl(dataUrl);
-        }
-        
-        setSuccess('Project compiled successfully!');
+        setSuccess('Compiled! Preview is shown below the editor.');
       } else {
         setCompilationStatus('error');
-        setError(data.message || 'Compilation failed');
+        setError(
+          data.compilation?.error ||
+            'Compilation failed. Add an index.html or .js file to your project.'
+        );
       }
     } catch (err) {
       setCompilationStatus('error');
@@ -860,7 +954,76 @@ function CollaborativeEditor({ roomId, onClose, participants = [] }) {
     setSelectedLanguage('javascript');
   };
 
-  // Scroll functions
+  const getFileContentForDownload = (file) => {
+    if (selectedFile && getFileId(file) === getFileId(selectedFile)) {
+      return fileContent;
+    }
+    return file.content || '';
+  };
+
+  const downloadCurrentFile = () => {
+    if (!selectedFile) {
+      setError('Select a file to download');
+      return;
+    }
+    downloadBlob(selectedFile.fileName, fileContent);
+    setSuccess(`Downloaded ${selectedFile.fileName}`);
+  };
+
+  const exportProject = async () => {
+    if (!selectedProject) {
+      setError('Select a project first');
+      return;
+    }
+
+    setLoading(true);
+    try {
+      const apiUrl = getApiUrl();
+      const response = await fetch(`${apiUrl}/api/projects/${selectedProject.projectId}`);
+      const data = await response.json();
+      const projectFiles = data.success ? data.project.files || files : files;
+
+      if (projectFiles.length === 0) {
+        setError('No files in this project to export');
+        return;
+      }
+
+      const exportPayload = {
+        name: selectedProject.name,
+        projectId: selectedProject.projectId,
+        roomId,
+        exportedAt: new Date().toISOString(),
+        files: projectFiles.map((file) => ({
+          fileName: file.fileName,
+          fileType: file.fileType,
+          content: getFileContentForDownload(file),
+        })),
+      };
+
+      const safeName = selectedProject.name.replace(/[^\w.-]+/g, '_');
+      downloadBlob(
+        `${safeName}-export.json`,
+        JSON.stringify(exportPayload, null, 2),
+        'application/json;charset=utf-8'
+      );
+
+      for (let i = 0; i < projectFiles.length; i += 1) {
+        const file = projectFiles[i];
+        await new Promise((resolve) => setTimeout(resolve, i * 250));
+        downloadBlob(file.fileName, getFileContentForDownload(file));
+      }
+
+      setSuccess(
+        `Exported ${projectFiles.length} file(s) + ${safeName}-export.json to your Downloads folder`
+      );
+    } catch (err) {
+      setError('Could not export project');
+      console.error(err);
+    } finally {
+      setLoading(false);
+    }
+  };
+
   const scrollToTop = () => {
     if (contentRef.current) {
       contentRef.current.scrollTo({
@@ -881,9 +1044,9 @@ function CollaborativeEditor({ roomId, onClose, participants = [] }) {
   };
 
   const scrollToPreview = () => {
-    const previewSection = document.querySelector('.preview-section');
-    if (previewSection) {
-      previewSection.scrollIntoView({
+    const previewPanel = document.querySelector('.preview-panel');
+    if (previewPanel) {
+      previewPanel.scrollIntoView({
         behavior: 'smooth',
         block: 'start'
       });
@@ -900,17 +1063,17 @@ function CollaborativeEditor({ roomId, onClose, participants = [] }) {
     setError('');
 
     try {
-      const apiUrl = process.env.REACT_APP_API_URL || 'http://localhost:5000';
+      const apiUrl = getApiUrl();
       
       // Create a file object for the pasted code
       const fileData = {
         projectId: selectedProject.projectId,
         fileName: fileName,
         filePath: `/${fileName}`,
-        fileType: selectedLanguage,
+        fileType: getFileTypeFromName(fileName) || selectedLanguage,
         content: pastedCode,
-        uploadedBy: user?.email || user?.username,
-        lastModifiedBy: user?.email || user?.username,
+        uploadedBy: getUserId(user),
+        lastModifiedBy: getUserId(user),
         metadata: {
           size: pastedCode.length,
           encoding: 'utf8',
@@ -973,16 +1136,8 @@ function CollaborativeEditor({ roomId, onClose, participants = [] }) {
     }
   };
 
-  if (!isAuthenticated) {
-    return (
-      <div className="collaborative-editor-overlay" onClick={onClose}>
-        <div className="collaborative-editor-container" onClick={e => e.stopPropagation()}>
-          <div className="error-message">
-            Please log in to use the collaborative editor.
-          </div>
-        </div>
-      </div>
-    );
+  if (!user) {
+    return null;
   }
 
   return (
@@ -991,11 +1146,11 @@ function CollaborativeEditor({ roomId, onClose, participants = [] }) {
         <div className="collaborative-editor-header">
           <h2>🚀 Collaborative Code Editor</h2>
           <div className="header-controls">
-            <div className={`collaborative-status ${socketService.isConnected() ? 'connected' : 'disconnected'}`}>
+            <div className={`collaborative-status ${socketConnected ? 'connected' : 'disconnected'}`}>
               <div className="status-indicator"></div>
-              <span>{socketService.isConnected() ? 'Live Collaboration Active' : 'Disconnected'}</span>
+              <span>{socketConnected ? 'Live Collaboration Active' : 'Disconnected'}</span>
               <span style={{ fontSize: '10px', marginLeft: '10px' }}>
-                Socket: {socketService.isConnected() ? '✅' : '❌'} | 
+                Socket: {socketConnected ? '✅' : '❌'} | 
                 Room: {roomId ? '✅' : '❌'} | 
                 User: {user ? '✅' : '❌'}
               </span>
@@ -1007,17 +1162,30 @@ function CollaborativeEditor({ roomId, onClose, participants = [] }) {
         <div className="collaborative-editor-content" ref={contentRef}>
           {error && <div className="error-message">{error}</div>}
           {success && <div className="success-message">{success}</div>}
-          {/* Project Selection */}
-          <div id="project-section" className="project-section">
-            <div className="section-header">
-              <h3>📁 Projects</h3>
-              <button onClick={createProject} className="btn-primary" disabled={loading}>
-                + New Project
-              </button>
-            </div>
-            
+          <div className="editor-workspace">
+            <aside className="editor-sidebar">
+              <div className="sidebar-section projects-panel">
+                <div className="sidebar-section-header">
+                  <h3>Projects</h3>
+                  <button
+                    type="button"
+                    onClick={openNewProjectModal}
+                    className="sidebar-btn"
+                    disabled={loading}
+                  >
+                    + New
+                  </button>
+                </div>
+
+                <div className="sidebar-scroll">
+            {projects.length === 0 && !loading && (
+              <p className="sidebar-empty">
+                No projects yet. Click <strong>+ New</strong>.
+              </p>
+            )}
+
             <div className="projects-list">
-              {projects.map(project => (
+              {projects.map((project) => (
                 <div 
                   key={project.projectId}
                   className={`project-item ${selectedProject?.projectId === project.projectId ? 'active' : ''}`}
@@ -1028,56 +1196,29 @@ function CollaborativeEditor({ roomId, onClose, participants = [] }) {
                 >
                   <div className="project-name">{project.name}</div>
                   <div className="project-meta">
-                    {project.collaborators.length} collaborator{project.collaborators.length !== 1 ? 's' : ''}
+                    {(project.collaborators || []).length} collaborator{(project.collaborators || []).length !== 1 ? 's' : ''}
                   </div>
                 </div>
               ))}
             </div>
-          </div>
-
-          {/* File Management */}
-          {selectedProject && (
-            <div id="files-section" className="files-section">
-              <div className="section-header">
-                <h3>📄 Files</h3>
-                <div className="file-actions">
-                  <input
-                    type="file"
-                    ref={fileInputRef}
-                    onChange={handleFileUpload}
-                    accept=".js,.jsx,.ts,.tsx,.css,.html,.json,.md,.txt"
-                    style={{ display: 'none' }}
-                  />
-                  <button 
-                    onClick={() => fileInputRef.current?.click()}
-                    className="btn-secondary"
-                    disabled={loading}
-                  >
-                    📤 Upload File
-                  </button>
-                  <button 
-                    onClick={handleCodePaste}
-                    className="btn-secondary"
-                    disabled={loading}
-                  >
-                    📝 Paste Code
-                  </button>
-                  <button 
-                    onClick={compileProject}
-                    className="btn-primary"
-                    disabled={loading || compilationStatus === 'compiling'}
-                  >
-                    {compilationStatus === 'compiling' ? '⏳ Compiling...' : '🔨 Compile'}
-                  </button>
                 </div>
               </div>
 
-              <div className="files-grid">
+              <div className="sidebar-section files-panel">
+                <div className="sidebar-section-header">
+                  <h3>Files</h3>
+                </div>
+                <div className="sidebar-scroll">
+                  {!selectedProject && <p className="sidebar-empty">Select a project.</p>}
+                  {selectedProject && files.length === 0 && !loading && (
+                    <p className="sidebar-empty">No files. Use Paste or Upload.</p>
+                  )}
+                  {selectedProject && (
                 <div className="files-list">
-                  {files.map(file => (
-                    <div 
-                      key={file._id}
-                      className={`file-item ${selectedFile?._id === file._id ? 'active' : ''}`}
+                  {files.map((file) => (
+                    <div
+                      key={getFileId(file)}
+                      className={`file-item ${getFileId(selectedFile) === getFileId(file) ? 'active' : ''}`}
                     >
                       <div className="file-content" onClick={() => handleFileSelect(file)}>
                         <div className="file-icon">
@@ -1096,7 +1237,7 @@ function CollaborativeEditor({ roomId, onClose, participants = [] }) {
                         <button
                           onClick={(e) => {
                             e.stopPropagation();
-                            handleFileDelete(file._id);
+                            handleFileDelete(getFileId(file));
                           }}
                           className="delete-btn"
                           title="Delete file"
@@ -1108,11 +1249,55 @@ function CollaborativeEditor({ roomId, onClose, participants = [] }) {
                     </div>
                   ))}
                 </div>
+                  )}
+                </div>
+              </div>
+            </aside>
 
-                {selectedFile && (
+            <main className="editor-main">
+              {!selectedProject ? (
+                <div className="editor-welcome">
+                  <p><strong>Select or create a project</strong> in the left sidebar.</p>
+                </div>
+              ) : (
+                <>
+                  <div className="editor-toolbar">
+                    <span className="file-name-badge">
+                      {selectedProject.name}
+                      {selectedFile ? ` / ${selectedFile.fileName}` : ''}
+                    </span>
+                    <input
+                      type="file"
+                      ref={fileInputRef}
+                      onChange={handleFileUpload}
+                      accept=".js,.jsx,.ts,.tsx,.css,.html,.json,.md,.txt"
+                      style={{ display: 'none' }}
+                    />
+                    <button type="button" onClick={() => fileInputRef.current?.click()} className="btn-secondary" disabled={loading}>Upload</button>
+                    <button type="button" onClick={handleCodePaste} className="btn-secondary" disabled={loading}>Paste</button>
+                    <button type="button" onClick={compileProject} className="btn-primary" disabled={loading || compilationStatus === 'compiling'}>
+                      {compilationStatus === 'compiling' ? 'Compiling...' : 'Compile'}
+                    </button>
+                    {selectedFile && (
+                      <button type="button" onClick={handleFileSave} className="btn-save" disabled={loading}>Save</button>
+                    )}
+                    {selectedFile && (
+                      <button type="button" onClick={downloadCurrentFile} className="btn-secondary" disabled={loading}>
+                        Download file
+                      </button>
+                    )}
+                    <button type="button" onClick={exportProject} className="btn-secondary" disabled={loading || !selectedProject || files.length === 0}>
+                      Export project
+                    </button>
+                  </div>
+
+                  {!selectedFile ? (
+                    <div className="editor-welcome">
+                      <p>Pick a file from the sidebar, or paste/upload code.</p>
+                    </div>
+                  ) : (
                   <div className="file-editor">
                     <div className="editor-header">
-                      <span className="file-name">{selectedFile.fileName}</span>
                       <div className="editor-controls">
                         {/* User presence indicators */}
                         <div className="user-presence">
@@ -1185,7 +1370,7 @@ function CollaborativeEditor({ roomId, onClose, participants = [] }) {
                                 roomId,
                                 projectId: selectedProject.projectId,
                                 fileId: selectedFile._id,
-                                userId: user.email || user.username,
+                                userId: getUserId(user),
                                 position: 10,
                                 selection: { start: 10, end: 10 }
                               });
@@ -1236,14 +1421,7 @@ function CollaborativeEditor({ roomId, onClose, participants = [] }) {
                           🧪 Test
                         </button>
                         <button 
-                          onClick={() => {
-                            console.log('Force reconnecting socket...');
-                            socketService.disconnect();
-                            setTimeout(() => {
-                              socketService.connect();
-                              console.log('Socket reconnected');
-                            }, 1000);
-                          }}
+                          onClick={reconnectSocket}
                           className="btn-secondary"
                           style={{ fontSize: '12px', padding: '4px 8px' }}
                         >
@@ -1304,95 +1482,105 @@ function CollaborativeEditor({ roomId, onClose, participants = [] }) {
                       </div>
                     </div>
                   </div>
-                )}
-              </div>
-            </div>
-          )}
-
-
-          {/* Compilation Status */}
-          {compilationStatus === 'success' && previewUrl && (
-            <div className="preview-section">
-              <h3>👀 Live Preview</h3>
-              <div className="preview-container">
-                <div className="preview-wrapper">
-                  {previewUrl.startsWith('data:') ? (
-                    <iframe
-                      src={previewUrl}
-                      className="preview-iframe"
-                      title="Project Preview"
-                      onLoad={() => {
-                        console.log('Data URL iframe loaded:', previewUrl);
-                        console.log('Iframe content loaded successfully');
-                      }}
-                      onError={(e) => {
-                        console.error('Data URL iframe error:', e);
-                        console.log('Falling back to direct content display');
-                      }}
-                      style={{ 
-                        width: '100%', 
-                        height: '600px', 
-                        border: '2px solid #007bff', 
-                        borderRadius: '8px',
-                        backgroundColor: '#fff',
-                        boxShadow: '0 4px 12px rgba(0,0,0,0.1)'
-                      }}
-                    />
-                  ) : (
-                    <iframe
-                      src={previewUrl}
-                      className="preview-iframe"
-                      title="Project Preview"
-                      sandbox="allow-scripts allow-same-origin allow-forms allow-popups allow-top-navigation"
-                      allow="camera; microphone; fullscreen"
-                      onLoad={() => {
-                        console.log('Preview iframe loaded:', previewUrl);
-                        console.log('Iframe content loaded successfully');
-                      }}
-                      onError={(e) => {
-                        console.error('Preview iframe error:', e);
-                        console.log('Falling back to direct content display');
-                      }}
-                      style={{ 
-                        width: '100%', 
-                        height: '600px', 
-                        border: '2px solid #007bff', 
-                        borderRadius: '8px',
-                        backgroundColor: '#fff',
-                        boxShadow: '0 4px 12px rgba(0,0,0,0.1)'
-                      }}
-                    />
                   )}
-                </div>
-              </div>
-              <div className="preview-actions">
-                <button 
-                  onClick={() => {
-                    const iframe = document.querySelector('.preview-iframe');
-                    if (iframe) {
-                      iframe.src = iframe.src; // Force refresh
-                    }
-                  }}
-                  className="btn-primary"
-                >
-                  🔄 Refresh Preview
-                </button>
-                <button 
-                  onClick={() => window.open(previewUrl, '_blank')}
-                  className="btn-secondary"
-                >
-                  🔗 Open in New Tab
-                </button>
-                <button 
-                  onClick={() => setPreviewUrl('')}
-                  className="btn-secondary"
-                >
-                  ❌ Close Preview
-                </button>
-              </div>
-            </div>
-          )}
+
+                  {showPreview && previewHtml && (
+                    <div className="preview-panel">
+                      <div className="preview-panel-header">
+                        <h3>Live Preview</h3>
+                        <div className="preview-panel-actions">
+                          <button
+                            type="button"
+                            className="btn-secondary"
+                            onClick={() => {
+                              if (previewUrl) {
+                                window.open(previewUrl, '_blank');
+                              } else if (selectedProject) {
+                                window.open(
+                                  `${getApiUrl()}/api/projects/${selectedProject.projectId}/preview`,
+                                  '_blank'
+                                );
+                              }
+                            }}
+                          >
+                            Open tab
+                          </button>
+                          <button
+                            type="button"
+                            className="btn-secondary"
+                            onClick={closePreview}
+                          >
+                            Close
+                          </button>
+                        </div>
+                      </div>
+                      <iframe
+                        srcDoc={previewHtml}
+                        className="preview-iframe"
+                        title="Project Preview"
+                        sandbox="allow-scripts allow-same-origin allow-forms"
+                      />
+                    </div>
+                  )}
+                </>
+              )}
+            </main>
+          </div>
         </div>
+
+        {/* New Project Modal */}
+        {showNewProjectModal && (
+          <div
+            className="code-paste-overlay"
+            onClick={() => !loading && setShowNewProjectModal(false)}
+          >
+            <div
+              className="code-paste-modal"
+              onClick={(e) => e.stopPropagation()}
+            >
+              <div className="code-paste-header">
+                <h3>New project</h3>
+                <button
+                  type="button"
+                  onClick={() => setShowNewProjectModal(false)}
+                  className="close-btn"
+                  disabled={loading}
+                >
+                  ×
+                </button>
+              </div>
+              <form className="code-paste-content" onSubmit={createProject}>
+                <div className="form-group">
+                  <label htmlFor="new-project-name">Project name</label>
+                  <input
+                    id="new-project-name"
+                    ref={newProjectInputRef}
+                    type="text"
+                    value={newProjectName}
+                    onChange={(e) => setNewProjectName(e.target.value)}
+                    placeholder="e.g. Team Snippets"
+                    className="form-input"
+                    disabled={loading}
+                    autoFocus
+                  />
+                </div>
+                <div className="paste-actions">
+                  <button
+                    type="button"
+                    className="btn-secondary"
+                    onClick={() => setShowNewProjectModal(false)}
+                    disabled={loading}
+                  >
+                    Cancel
+                  </button>
+                  <button type="submit" className="btn-primary" disabled={loading}>
+                    {loading ? 'Creating...' : 'Create project'}
+                  </button>
+                </div>
+              </form>
+            </div>
+          </div>
+        )}
 
         {/* Code Paste Modal */}
         {showCodePaste && (
