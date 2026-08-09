@@ -1,11 +1,41 @@
 const express = require('express');
 const multer = require('multer');
+const fs = require('fs');
 const router = express.Router();
 const path = require('path');
 
-// Simple in-memory storage for local development
+const STORE_PATH = path.join(__dirname, '..', 'data', 'projects-store.json');
+
 let projects = [];
 let projectFiles = [];
+
+function loadStore() {
+  try {
+    if (fs.existsSync(STORE_PATH)) {
+      const data = JSON.parse(fs.readFileSync(STORE_PATH, 'utf8'));
+      projects = data.projects || [];
+      projectFiles = data.projectFiles || [];
+    }
+  } catch (error) {
+    console.error('Error loading projects store:', error.message);
+    projects = [];
+    projectFiles = [];
+  }
+}
+
+function saveStore() {
+  try {
+    fs.mkdirSync(path.dirname(STORE_PATH), { recursive: true });
+    fs.writeFileSync(
+      STORE_PATH,
+      JSON.stringify({ projects, projectFiles }, null, 2)
+    );
+  } catch (error) {
+    console.error('Error saving projects store:', error.message);
+  }
+}
+
+loadStore();
 
 // Helper function to generate unique IDs
 const generateId = () => {
@@ -127,8 +157,8 @@ router.post('/create', async (req, res) => {
       updatedAt: timestamp
     };
 
-    // Store in memory
     projects.push(project);
+    saveStore();
 
     res.status(201).json({
       success: true,
@@ -246,6 +276,7 @@ router.post('/:projectId/files/paste', async (req, res) => {
     };
 
     projectFiles.push(projectFile);
+    saveStore();
 
     res.status(201).json({
       success: true,
@@ -310,6 +341,7 @@ router.post('/:projectId/files/upload', upload.single('file'), async (req, res) 
     };
 
     projectFiles.push(projectFile);
+    saveStore();
 
     res.status(201).json({
       success: true,
@@ -362,6 +394,7 @@ router.put('/:projectId/files/:fileId', async (req, res) => {
     projectFiles[fileIndex].content = content;
     projectFiles[fileIndex].lastModifiedBy = lastModifiedBy;
     projectFiles[fileIndex].updatedAt = formatTimestamp();
+    saveStore();
 
     res.json({
       success: true,
@@ -374,6 +407,47 @@ router.put('/:projectId/files/:fileId', async (req, res) => {
       success: false,
       message: 'Error updating file',
       error: error.message
+    });
+  }
+});
+
+// Delete file from project
+router.delete('/:projectId/files/:fileId', async (req, res) => {
+  try {
+    const { projectId, fileId } = req.params;
+
+    const project = projects.find((p) => p.projectId === projectId);
+    if (!project) {
+      return res.status(404).json({
+        success: false,
+        message: 'Project not found',
+      });
+    }
+
+    const before = projectFiles.length;
+    projectFiles = projectFiles.filter(
+      (f) => !(f.projectId === projectId && f.fileId === fileId)
+    );
+
+    if (projectFiles.length === before) {
+      return res.status(404).json({
+        success: false,
+        message: 'File not found',
+      });
+    }
+
+    saveStore();
+
+    res.json({
+      success: true,
+      message: 'File deleted successfully',
+    });
+  } catch (error) {
+    console.error('Error deleting file:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Error deleting file',
+      error: error.message,
     });
   }
 });
@@ -408,10 +482,20 @@ router.post('/:projectId/compile', async (req, res) => {
     project.compilation.errorLog = compilationResult.error;
     project.compilation.previewUrl = compilationResult.previewUrl;
 
+    if (!compilationResult.success) {
+      return res.status(400).json({
+        success: false,
+        message: compilationResult.error || 'Compilation failed',
+        compilation: compilationResult,
+      });
+    }
+
+    saveStore();
+
     res.json({
       success: true,
       message: 'Project compiled successfully',
-      compilation: compilationResult
+      compilation: compilationResult,
     });
   } catch (error) {
     console.error('Error compiling project:', error);
@@ -476,8 +560,12 @@ router.get('/:projectId/preview', async (req, res) => {
     if (!compilation.success) {
       return res.status(400).send(`Compilation Error: ${compilation.error}`);
     }
+
+    if (project.compilation?.buildOutput) {
+      res.setHeader('Content-Type', 'text/html');
+      return res.send(project.compilation.buildOutput);
+    }
     
-    // Set content type and send HTML
     res.setHeader('Content-Type', 'text/html');
     res.send(compilation.output);
     
@@ -533,22 +621,42 @@ router.get('/:projectId/:filename', async (req, res) => {
   }
 });
 
+function fileKind(file) {
+  const name = (file.fileName || '').toLowerCase();
+  if (file.fileType === 'html' || name.endsWith('.html') || name.endsWith('.htm')) {
+    return 'html';
+  }
+  if (file.fileType === 'css' || name.endsWith('.css')) return 'css';
+  if (
+    file.fileType === 'javascript' ||
+    file.fileType === 'jsx' ||
+    file.fileType === 'nodejs' ||
+    name.endsWith('.js') ||
+    name.endsWith('.jsx')
+  ) {
+    return 'js';
+  }
+  return 'other';
+}
+
 // Helper function to compile project
 async function compileProject(project, files) {
   try {
-    // This is a simplified compilation process
-    // In a real implementation, you would use tools like Webpack, Vite, or custom compilers
-    
-    const htmlFile = files.find(f => f.fileType === 'html');
-    const cssFiles = files.filter(f => f.fileType === 'css');
-    const jsFiles = files.filter(f => f.fileType === 'javascript' || f.fileType === 'jsx');
+    const htmlFiles = files.filter((f) => fileKind(f) === 'html');
+    const cssFiles = files.filter((f) => fileKind(f) === 'css');
+    const jsFiles = files.filter((f) => fileKind(f) === 'js');
 
-    if (!htmlFile) {
+    let htmlBody = '';
+    if (htmlFiles.length > 0) {
+      htmlBody = htmlFiles.map((f) => f.content).join('\n');
+    } else if (jsFiles.length > 0 || cssFiles.length > 0) {
+      htmlBody = '<div id="app"><h1>Preview</h1><p>Compiled from your project files.</p></div>';
+    } else {
       return {
         success: false,
-        error: 'No HTML file found. Please upload an index.html file.',
+        error: 'Add at least one .html, .js, or .css file to compile.',
         output: '',
-        previewUrl: null
+        previewUrl: null,
       };
     }
 
@@ -586,7 +694,7 @@ async function compileProject(project, files) {
 </head>
 <body>
     <div class="container">
-        ${htmlFile.content}
+        ${htmlBody}
     </div>
     <script>
         // Add error handling for JavaScript

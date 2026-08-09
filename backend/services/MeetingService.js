@@ -241,6 +241,12 @@ class MeetingService {
     return result.Items || [];
   }
 
+  async getAllMeetings() {
+    const params = { TableName: TABLES.MEETINGS };
+    const result = await dynamodb.scan(params).promise();
+    return result.Items || [];
+  }
+
   // Search meetings by title
   async searchMeetings(searchText, limit = 20) {
     const params = {

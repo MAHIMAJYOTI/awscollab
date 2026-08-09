@@ -108,24 +108,32 @@ class ChatRoomService {
 
   // Add participant to room
   async addParticipant(roomId, participant) {
+    const room = await this.getRoomById(roomId);
+    if (!room) return null;
+
     const timestamp = formatTimestamp();
-    
-    const params = {
-      TableName: TABLES.CHAT_ROOMS,
-      Key: { roomId },
-      UpdateExpression: 'SET participants = list_append(participants, :participant), lastActivity = :lastActivity',
-      ExpressionAttributeValues: {
-        ':participant': [{
-          ...participant,
-          joinedAt: timestamp
-        }],
-        ':lastActivity': timestamp
-      },
-      ReturnValues: 'ALL_NEW'
+    const username =
+      typeof participant === 'string' ? participant : participant?.username;
+    const participants = room.participants || [];
+
+    const alreadyInRoom = participants.some((p) => {
+      const name = typeof p === 'string' ? p : p?.username;
+      return name === username;
+    });
+    if (alreadyInRoom) {
+      return room;
+    }
+
+    const newParticipant = {
+      ...participant,
+      username,
+      joinedAt: timestamp,
     };
 
-    const result = await dynamodb.update(params).promise();
-    return result.Attributes;
+    return await this.updateRoom(roomId, {
+      participants: [...participants, newParticipant],
+      lastActivity: timestamp,
+    });
   }
 
   // Remove participant from room
@@ -142,15 +150,18 @@ class ChatRoomService {
 
   // Check if user is admin
   isUserAdmin(room, username) {
-    return room.admins.includes(username) || room.createdBy === username;
+    return (room.admins || []).includes(username) || room.createdBy === username;
   }
 
   // Check if user has specific permission
   hasPermission(room, username, permission) {
     if (room.createdBy === username) return true; // Creator has all permissions
-    if (!room.admins.includes(username)) return false;
+    if (!(room.admins || []).includes(username)) return false;
     
-    const participant = room.participants.find(p => p.username === username);
+    const participant = (room.participants || []).find((p) => {
+      const name = typeof p === 'string' ? p : p?.username;
+      return name === username;
+    });
     return participant && participant.permissions && participant.permissions[permission];
   }
 
@@ -179,6 +190,8 @@ class ChatRoomService {
   // Get all unique participants
   getAllUniqueParticipants(room) {
     const uniqueParticipants = new Map();
+    const admins = room.admins || [];
+    const participants = room.participants || [];
     
     // Add creator
     if (room.createdBy) {
@@ -192,7 +205,7 @@ class ChatRoomService {
     }
     
     // Add admins
-    room.admins.forEach(admin => {
+    admins.forEach(admin => {
       if (admin && !uniqueParticipants.has(admin)) {
         uniqueParticipants.set(admin, {
           username: admin,
@@ -205,14 +218,19 @@ class ChatRoomService {
     });
     
     // Add participants
-    room.participants.forEach(participant => {
-      if (participant.username && !uniqueParticipants.has(participant.username)) {
-        uniqueParticipants.set(participant.username, {
-          username: participant.username,
-          isCreator: participant.username === room.createdBy,
-          isAdmin: room.admins.includes(participant.username),
-          joinedAt: participant.joinedAt,
-          color: participant.color || '#007bff'
+    participants.forEach(participant => {
+      const username =
+        typeof participant === 'string'
+          ? participant
+          : participant?.username;
+      if (username && !uniqueParticipants.has(username)) {
+        const p = typeof participant === 'string' ? { username: participant } : participant;
+        uniqueParticipants.set(username, {
+          username,
+          isCreator: username === room.createdBy,
+          isAdmin: admins.includes(username),
+          joinedAt: p.joinedAt,
+          color: p.color || '#007bff',
         });
       }
     });

@@ -144,15 +144,22 @@ app.use((req, res, next) => {
 
 app.use(express.json());
 
+const { useLocalStore } = require('./config/dynamodb');
+
 // DynamoDB connection test
 const testDynamoDBConnection = async () => {
   try {
     await dynamodb.scan({ TableName: 'ChatRooms', Limit: 1 }).promise();
-    console.log('DynamoDB connected successfully');
+    console.log(
+      useLocalStore
+        ? 'Local storage ready'
+        : 'DynamoDB connected successfully'
+    );
   } catch (error) {
-    console.error('DynamoDB connection failed:', error.message);
-    console.log('Make sure your AWS credentials are configured and tables exist');
-    // Don't exit process, just log the error
+    console.error('Database connection failed:', error.message);
+    if (!useLocalStore) {
+      console.log('Set USE_LOCAL_STORE=true in .env to run without AWS');
+    }
   }
 };
 
@@ -160,10 +167,16 @@ testDynamoDBConnection();
 
 // Routes
 app.use('/api/auth', require('./routes/auth'));
+app.use('/api/setup', require('./routes/setup'));
 app.use('/api/rooms', require('./routes/chatrooms'));
 app.use('/api/jdoodle', require('./routes/jdoodle'));
-app.use('/api/meetings', require('./routes/meetings'));
-app.use('/api/projects', require('./routes/projects'));
+app.use('/api/meetings', require('./routes/meetings')(io));
+app.use(
+  '/api/projects',
+  useLocalStore
+    ? require('./routes/projects-local')
+    : require('./routes/projects')
+);
 
 // Socket.IO real-time chat functionality
 const MessageService = require('./services/MessageService');
@@ -176,6 +189,110 @@ const chatRoomService = new ChatRoomService();
 // Store connected users and their rooms
 const connectedUsers = new Map();
 const roomUsers = new Map();
+const videoParticipants = new Map(); // roomId -> Map(socketId -> participant)
+
+const upsertVideoParticipant = (roomId, { socketId, userId, username, email }) => {
+  if (!socketId) return;
+  if (!videoParticipants.has(roomId)) {
+    videoParticipants.set(roomId, new Map());
+  }
+  videoParticipants.get(roomId).set(socketId, {
+    socketId,
+    userId: userId || username,
+    username: username || userId,
+    email: email || '',
+  });
+};
+
+const removeVideoParticipantBySocket = (roomId, socketId) => {
+  const bucket = videoParticipants.get(roomId);
+  if (!bucket) return;
+  bucket.delete(socketId);
+  if (bucket.size === 0) {
+    videoParticipants.delete(roomId);
+  }
+};
+
+const getVideoParticipantsList = (roomId, excludeSocketId = null) => {
+  const bucket = videoParticipants.get(roomId);
+  if (!bucket) return [];
+  for (const sid of bucket.keys()) {
+    if (!io.sockets.sockets.has(sid)) {
+      bucket.delete(sid);
+    }
+  }
+  return Array.from(bucket.values()).filter((p) => p.socketId !== excludeSocketId);
+};
+
+const getPeerId = (user) => {
+  if (!user) return null;
+  // Must match frontend chatUser.username used for WebRTC to/from fields
+  return String(user.username || user.email || user.id || '');
+};
+
+const normalizePeerId = (id) => String(id || '').trim().toLowerCase();
+
+const getUserKey = (user) => normalizePeerId(getPeerId(user));
+
+const getRoomUsersList = (roomId) => {
+  const bucket = roomUsers.get(roomId);
+  if (!bucket) return [];
+  return Array.from(bucket.values());
+};
+
+const upsertRoomUser = (roomId, user) => {
+  if (!roomUsers.has(roomId)) {
+    roomUsers.set(roomId, new Map());
+  }
+  roomUsers.get(roomId).set(getUserKey(user), user);
+};
+
+const removeRoomUser = (roomId, user) => {
+  const bucket = roomUsers.get(roomId);
+  if (!bucket) return;
+  bucket.delete(getUserKey(user));
+  if (bucket.size === 0) {
+    roomUsers.delete(roomId);
+  }
+};
+
+const broadcastRoomUsers = (roomId) => {
+  const onlineUsers = [];
+  for (const [socketId, info] of connectedUsers.entries()) {
+    if (info.roomId === roomId) {
+      onlineUsers.push({ ...info.user, socketId });
+    }
+  }
+  io.to(roomId).emit('room-users', onlineUsers);
+  io.to(roomId).emit('users-count', onlineUsers.length);
+};
+
+const findSocketIdInRoom = (roomId, peerId) => {
+  if (!peerId) return null;
+  const target = normalizePeerId(peerId);
+  for (const [socketId, info] of connectedUsers.entries()) {
+    if (info.roomId !== roomId) continue;
+    const u = info.user || {};
+    if (normalizePeerId(u.username) === target) return socketId;
+    if (normalizePeerId(u.email) === target) return socketId;
+    if (normalizePeerId(getPeerId(u)) === target) return socketId;
+  }
+  return null;
+};
+
+const emitToPeer = (roomId, target, event, payload) => {
+  if (target && io.sockets.sockets.has(target)) {
+    io.to(target).emit(event, payload);
+    return true;
+  }
+  const socketId = findSocketIdInRoom(roomId, target);
+  if (socketId) {
+    io.to(socketId).emit(event, payload);
+    return true;
+  }
+  io.to(normalizePeerId(String(target))).emit(event, payload);
+  return false;
+};
 
 io.on('connection', (socket) => {
   console.log('User connected:', socket.id);
@@ -188,15 +305,18 @@ io.on('connection', (socket) => {
       console.log('User:', user);
       
       socket.join(roomId);
+
+      const peerId = getPeerId(user);
+      if (peerId) {
+        socket.join(peerId);
+        socket.join(normalizePeerId(peerId));
+      }
       
       // Store user info
-      connectedUsers.set(socket.id, { user, roomId });
+      connectedUsers.set(socket.id, { user, roomId, peerId });
       
-      // Update room users
-      if (!roomUsers.has(roomId)) {
-        roomUsers.set(roomId, new Set());
-      }
-      roomUsers.get(roomId).add(JSON.stringify(user));
+      // One socket per normalized username (replaces stale mahi/MAHIMA duplicates)
+      upsertRoomUser(roomId, user);
       
       console.log(`${user.username || user.email} joined room ${roomId}`);
       
@@ -206,12 +326,7 @@ io.on('connection', (socket) => {
         message: `${user.username || user.email} joined the room`
       });
       
-      // Send current online users to the new user
-      const onlineUsers = Array.from(roomUsers.get(roomId) || []).map(u => JSON.parse(u));
-      socket.emit('room-users', onlineUsers);
-      
-      // Send online users count to room
-      io.to(roomId).emit('users-count', onlineUsers.length);
+      broadcastRoomUsers(roomId);
       
       console.log('=== JOIN ROOM SUCCESS ===');
       
@@ -464,18 +579,18 @@ io.on('connection', (socket) => {
     if (userInfo) {
       const { user, roomId } = userInfo;
       
-      // Remove user from room
+      removeRoomUser(roomId, user);
       if (roomUsers.has(roomId)) {
-        roomUsers.get(roomId).delete(JSON.stringify(user));
-        
-        // If room is empty, delete it
-        if (roomUsers.get(roomId).size === 0) {
-          roomUsers.delete(roomId);
-        } else {
-          // Update users count
-          const onlineUsers = Array.from(roomUsers.get(roomId) || []).map(u => JSON.parse(u));
-          io.to(roomId).emit('users-count', onlineUsers.length);
-        }
+        broadcastRoomUsers(roomId);
+      }
+
+      if (videoParticipants.has(roomId)) {
+        removeVideoParticipantBySocket(roomId, socket.id);
+        socket.to(roomId).emit('user-left-video', {
+          roomId,
+          socketId: socket.id,
+          userId: userInfo.peerId || getPeerId(user),
+        });
       }
       
       // Remove from connected users
@@ -497,16 +612,9 @@ io.on('connection', (socket) => {
   socket.on('leave-room', ({ roomId, user }) => {
     socket.leave(roomId);
     
-    // Remove user from room tracking
+    removeRoomUser(roomId, user);
     if (roomUsers.has(roomId)) {
-      roomUsers.get(roomId).delete(JSON.stringify(user));
-      
-      if (roomUsers.get(roomId).size === 0) {
-        roomUsers.delete(roomId);
-      } else {
-        const onlineUsers = Array.from(roomUsers.get(roomId) || []).map(u => JSON.parse(u));
-        io.to(roomId).emit('users-count', onlineUsers.length);
-      }
+      broadcastRoomUsers(roomId);
     }
     
     // Remove from connected users
@@ -525,75 +633,74 @@ io.on('connection', (socket) => {
   socket.on('user-joined-video', (data) => {
     console.log('📹 User joined video call:', data);
     const { roomId, userId, username } = data;
-    
-    // Broadcast to all other users in the room
-    socket.to(roomId).emit('user-joined-video', {
-      roomId,
+    if (!roomId || !(userId || username)) return;
+
+    const socketId = socket.id;
+    const alreadyInCall = getVideoParticipantsList(roomId, socketId);
+
+    upsertVideoParticipant(roomId, {
+      socketId,
       userId,
       username,
-      email: data.email
+      email: data.email,
     });
-    
-    console.log(`📹 ${username || userId} joined video call in room ${roomId}`);
+
+    if (alreadyInCall.length > 0) {
+      socket.emit('video-participants', { roomId, participants: alreadyInCall });
+    }
+
+    socket.to(roomId).emit('user-joined-video', {
+      roomId,
+      socketId,
+      userId,
+      username,
+      email: data.email,
+    });
+
+    console.log(`📹 ${username || userId} joined video call in room ${roomId} (${socketId})`);
   });
 
-  // Handle user leaving video call
   socket.on('user-left-video', (data) => {
     console.log('📹 User left video call:', data);
     const { roomId, userId } = data;
-    
-    // Broadcast to all other users in the room
+    if (!roomId) return;
+
+    removeVideoParticipantBySocket(roomId, data.socketId || socket.id);
+
     socket.to(roomId).emit('user-left-video', {
       roomId,
-      userId
+      socketId: data.socketId || socket.id,
+      userId,
     });
-    
+
     console.log(`📹 User ${userId} left video call in room ${roomId}`);
   });
 
-  // Handle WebRTC offer
+  // Handle WebRTC offer — deliver to target peer
   socket.on('webrtc-offer', (data) => {
-    console.log('📤 WebRTC offer received:', data);
-    const { roomId, to, from, offer } = data;
-    
-    // Forward offer to specific user
-    socket.to(to).emit('webrtc-offer', {
-      roomId,
-      from,
-      offer
-    });
-    
-    console.log(`📤 WebRTC offer forwarded from ${from} to ${to} in room ${roomId}`);
+    if (!data?.roomId || !data?.to) return;
+    const delivered = emitToPeer(data.roomId, data.to, 'webrtc-offer', data);
+    console.log(`📡 offer ${data.from} → ${data.to} ${delivered ? 'delivered' : 'FAILED'}`);
+    if (!delivered) {
+      socket.to(data.roomId).emit('webrtc-offer', data);
+    }
   });
 
-  // Handle WebRTC answer
   socket.on('webrtc-answer', (data) => {
-    console.log('📤 WebRTC answer received:', data);
-    const { roomId, to, from, answer } = data;
-    
-    // Forward answer to specific user
-    socket.to(to).emit('webrtc-answer', {
-      roomId,
-      from,
-      answer
-    });
-    
-    console.log(`📤 WebRTC answer forwarded from ${from} to ${to} in room ${roomId}`);
+    if (!data?.roomId || !data?.to) return;
+    const delivered = emitToPeer(data.roomId, data.to, 'webrtc-answer', data);
+    console.log(`📡 answer ${data.from} → ${data.to} ${delivered ? 'delivered' : 'FAILED'}`);
+    if (!delivered) {
+      socket.to(data.roomId).emit('webrtc-answer', data);
+    }
   });
 
-  // Handle ICE candidate
   socket.on('webrtc-ice-candidate', (data) => {
-    console.log('📤 WebRTC ICE candidate received:', data);
-    const { roomId, to, from, candidate } = data;
-    
-    // Forward ICE candidate to specific user
-    socket.to(to).emit('webrtc-ice-candidate', {
-      roomId,
-      from,
-      candidate
-    });
-    
-    console.log(`📤 WebRTC ICE candidate forwarded from ${from} to ${to} in room ${roomId}`);
+    if (!data?.roomId || !data?.to) return;
+    const delivered = emitToPeer(data.roomId, data.to, 'webrtc-ice-candidate', data);
+    if (!delivered) {
+      socket.to(data.roomId).emit('webrtc-ice-candidate', data);
+    }
   });
 
   // Handle video call started notification

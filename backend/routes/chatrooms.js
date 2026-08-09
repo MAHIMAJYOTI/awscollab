@@ -144,7 +144,7 @@ router.post('/', async (req, res) => {
     }
     
     // Get unique participants for response
-    const uniqueParticipants = room.participants || [];
+    const uniqueParticipants = chatRoomService.getAllUniqueParticipants(room);
     const uniqueParticipantCount = uniqueParticipants.length;
     
     res.json({
@@ -227,16 +227,25 @@ router.post('/:roomId/join', async (req, res) => {
       });
     }
     
+    const participantUsername = (p) =>
+      typeof p === 'string' ? p : p?.username;
+    const roomParticipants = room.participants || [];
+
     // Check if user is already a member (check all possible ways)
-    const isAlreadyMember = (room.participants && room.participants.some(p => p.username === sanitizedUsername)) || 
+    const isAlreadyMember = (roomParticipants.some(p => participantUsername(p) === sanitizedUsername)) || 
                            room.createdBy === sanitizedUsername || 
                            chatRoomService.isUserAdmin(room, sanitizedUsername);
     
     if (isAlreadyMember) {
-      return res.json({ 
-        success: true, 
+      const uniqueParticipants = chatRoomService.getAllUniqueParticipants(room);
+      return res.json({
+        success: true,
         message: 'Already a member of this room',
-        room 
+        room: {
+          ...room,
+          uniqueParticipants,
+          uniqueParticipantCount: uniqueParticipants.length,
+        },
       });
     }
     
@@ -265,8 +274,7 @@ router.post('/:roomId/join', async (req, res) => {
     // Refresh room data
     room = await chatRoomService.getRoomById(room.roomId);
     
-    // Get unique participants for response
-    const uniqueParticipants = room.participants || [];
+    const uniqueParticipants = chatRoomService.getAllUniqueParticipants(room);
     
     res.json({ 
       success: true, 
@@ -300,7 +308,9 @@ router.get('/:roomName', async (req, res) => {
     }
     
     // Check if user is a member of the room
-    const isParticipant = room.participants.some(p => p.username === username);
+    const participantUsername = (p) =>
+      typeof p === 'string' ? p : p?.username;
+    const isParticipant = (room.participants || []).some(p => participantUsername(p) === username);
     const isCreator = room.createdBy === username;
     const isAdmin = chatRoomService.isUserAdmin(room, username);
     const isMember = isParticipant || isCreator || isAdmin;
@@ -312,7 +322,9 @@ router.get('/:roomName', async (req, res) => {
       isCreator,
       isAdmin,
       isMember,
-      participants: room.participants.map(p => p.username),
+      participants: (room.participants || []).map((p) =>
+        typeof p === 'string' ? p : p.username
+      ),
       createdBy: room.createdBy,
       admins: room.admins
     });
@@ -322,7 +334,7 @@ router.get('/:roomName', async (req, res) => {
     }
     
     // Get unique participants for response
-    const uniqueParticipants = room.participants;
+    const uniqueParticipants = chatRoomService.getAllUniqueParticipants(room);
     
     res.json({
       success: true,
@@ -331,13 +343,13 @@ router.get('/:roomName', async (req, res) => {
         createdBy: room.createdBy,
         isPrivate: room.isPrivate,
         password: room.password,
-        participants: room.participants,
+        participants: uniqueParticipants,
         admins: room.admins,
         color: room.color,
         createdAt: room.createdAt,
         lastActivity: room.lastActivity,
         settings: room.settings,
-        uniqueParticipants: uniqueParticipants,
+        uniqueParticipants,
         uniqueParticipantCount: uniqueParticipants.length,
         roomId: room.roomId
       }
@@ -422,9 +434,10 @@ router.get('/:roomId/messages', async (req, res) => {
     
     // Get messages using DynamoDB service
     console.log('Step 3: Searching for messages with roomId:', room.roomId);
-    const messages = await messageService.getMessagesByRoom(room.roomId);
+    const result = await messageService.getMessagesByRoom(room.roomId);
+    const messages = result.messages || [];
     console.log('Step 4: Found', messages.length, 'messages');
-    
+
     res.status(200).json(messages);
   } catch (err) {
     console.error('=== ERROR IN GET MESSAGES ===');
@@ -472,25 +485,20 @@ router.post('/:roomId/messages', async (req, res) => {
       return res.status(404).json({ error: 'Room not found' });
     }
     
-    console.log('Step 2: Found room with ObjectId:', room._id);
-    
-    // Create message with room's ObjectId
-    console.log('Step 3: Creating message...');
-    const messageData = { 
-      room: room._id, 
-      user: sanitizedUser, 
-      text: sanitizedText, 
-      code: sanitizedCode, 
-      language, 
-      output 
-    };
-    console.log('Message data for creation:', messageData);
-    
-    const message = await messageService.createMessage(messageData);
+    console.log('Step 2: Found room with roomId:', room.roomId);
+
+    const message = await messageService.createMessage({
+      roomId: room.roomId,
+      user: sanitizedUser,
+      text: sanitizedText,
+      code: sanitizedCode,
+      language,
+      output,
+      isCode: Boolean(sanitizedCode),
+    });
     console.log('Step 4: Created message with ID:', message.messageId);
-    
-    console.log('Step 5: Message created successfully');
-    res.status(201).json(message);
+
+    res.status(201).json({ success: true, message });
   } catch (err) {
     console.error('=== ERROR IN CREATE MESSAGE ===');
     console.error('Error details:', err);
@@ -513,7 +521,7 @@ router.get('/:roomId/members', async (req, res) => {
     }
     
     // Check if user is admin
-    if (!room.isUserAdmin(username)) {
+    if (!chatRoomService.isUserAdmin(room, username)) {
       return res.status(403).json({ error: 'Admin privileges required' });
     }
     
@@ -526,73 +534,6 @@ router.get('/:roomId/members', async (req, res) => {
   } catch (err) {
     console.error('Error fetching room members:', err);
     res.status(500).json({ error: 'Failed to fetch members' });
-  }
-});
-
-// Delete a message (admin only)
-router.delete('/:roomId/messages/:messageId', async (req, res) => {
-  try {
-    const { roomId, messageId } = req.params;
-    const { username } = req.body; // Current user
-    
-    const room = await chatRoomService.getRoomByName(roomId);
-    if (!room) {
-      return res.status(404).json({ error: 'Room not found' });
-    }
-    
-    // Check if user is admin
-    if (!room.isUserAdmin(username)) {
-      return res.status(403).json({ error: 'Admin privileges required' });
-    }
-    
-    const message = await messageService.deleteMessage(messageId);
-    if (!message) {
-      return res.status(404).json({ error: 'Message not found' });
-    }
-    
-    res.json({ success: true, message: 'Message deleted successfully' });
-  } catch (err) {
-    console.error('Error deleting message:', err);
-    res.status(500).json({ error: 'Failed to delete message' });
-  }
-});
-
-// Remove a member (admin only)
-router.delete('/:roomId/members/:username', async (req, res) => {
-  try {
-    const { roomId, username: targetUsername } = req.params;
-    const { username: adminUsername } = req.body; // Admin performing the action
-    
-    const room = await chatRoomService.getRoomByName(roomId);
-    if (!room) {
-      return res.status(404).json({ error: 'Room not found' });
-    }
-    
-    // Check if admin has permission
-    if (!chatRoomService.hasPermission(room, adminUsername, 'canRemoveMembers')) {
-      return res.status(403).json({ error: 'Permission denied' });
-    }
-    
-    // Can't remove the creator
-    if (targetUsername === room.createdBy) {
-      return res.status(400).json({ error: 'Cannot remove room creator' });
-    }
-    
-    // Remove from participants
-    room.participants = room.participants.filter(p => p.username !== targetUsername);
-    
-    // Remove from admins if they were an admin
-    room.admins = room.admins.filter(admin => admin !== targetUsername);
-    
-    await chatRoomService.updateRoom(room.roomId, {
-      participants: room.participants,
-      admins: room.admins
-    });
-    
-    res.json({ success: true, message: 'Member removed successfully' });
-  } catch (err) {
-    console.error('Error removing member:', err);
-    res.status(500).json({ error: 'Failed to remove member' });
   }
 });
 
@@ -723,24 +664,17 @@ router.delete('/:roomId/messages/:messageId', async (req, res) => {
   try {
     const { roomId, messageId } = req.params;
     const { username } = req.body;
-    
+
     const room = await chatRoomService.getRoomByName(roomId);
     if (!room) {
       return res.status(404).json({ error: 'Room not found' });
     }
-    
-    // Check if user has permission
+
     if (!chatRoomService.hasPermission(room, username, 'canDeleteMessages')) {
       return res.status(403).json({ error: 'Permission denied' });
     }
-    
-    // Find and delete the message
-    const message = await messageService.deleteMessage(messageId);
-    
-    if (!message) {
-      return res.status(404).json({ error: 'Message not found' });
-    }
-    
+
+    await messageService.deleteMessage(messageId);
     res.json({ success: true, message: 'Message deleted successfully' });
   } catch (err) {
     console.error('Error deleting message:', err);
