@@ -1,17 +1,30 @@
 const AWS = require('aws-sdk');
 require('dotenv').config();
+const { createLocalDocumentClient } = require('./localDynamodb');
 
-// Configure AWS SDK
-AWS.config.update({
-  region: process.env.AWS_REGION || 'us-east-1',
-  accessKeyId: process.env.AWS_ACCESS_KEY_ID,
-  secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY
-});
+const isPlaceholderKey = (value) =>
+  !value ||
+  value.includes('your_') ||
+  value.includes('YOUR_');
 
-// Create DynamoDB instance
-const dynamodb = new AWS.DynamoDB.DocumentClient();
+const useLocalStore =
+  process.env.USE_LOCAL_STORE === 'true' ||
+  (process.env.USE_LOCAL_STORE !== 'false' &&
+    isPlaceholderKey(process.env.AWS_ACCESS_KEY_ID) &&
+    isPlaceholderKey(process.env.AWS_SECRET_ACCESS_KEY));
 
-// Table names
+let dynamodb;
+
+if (useLocalStore) {
+  dynamodb = createLocalDocumentClient();
+  console.log('📦 Using local file storage (backend/data/local-db.json) — no AWS required');
+} else {
+  const { configureAws } = require('../scripts/awsClient');
+  configureAws();
+  dynamodb = new AWS.DynamoDB.DocumentClient();
+  console.log('☁️  Using AWS DynamoDB — region:', process.env.AWS_REGION || 'us-east-1');
+}
+
 const TABLES = {
   CHAT_ROOMS: 'ChatRooms',
   MESSAGES: 'Messages',
@@ -19,28 +32,21 @@ const TABLES = {
   CHAT_MESSAGES: 'ChatMessages',
   LIVE_CODE: 'LiveCode',
   PROJECTS: 'Projects',
-  PROJECT_FILES: 'ProjectFiles'
+  PROJECT_FILES: 'ProjectFiles',
 };
 
-// Helper function to generate unique IDs
-const generateId = () => {
-  return Date.now().toString() + Math.random().toString(36).substr(2, 9);
-};
+const generateId = () =>
+  Date.now().toString() + Math.random().toString(36).substr(2, 9);
 
-// Helper function to format timestamps
-const formatTimestamp = (date = new Date()) => {
-  return date.toISOString();
-};
+const formatTimestamp = (date = new Date()) => date.toISOString();
 
-// Helper function to parse timestamps
-const parseTimestamp = (timestamp) => {
-  return new Date(timestamp);
-};
+const parseTimestamp = (timestamp) => new Date(timestamp);
 
 module.exports = {
   dynamodb,
   TABLES,
   generateId,
   formatTimestamp,
-  parseTimestamp
+  parseTimestamp,
+  useLocalStore,
 };
