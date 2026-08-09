@@ -2,6 +2,8 @@ import React, { useState, useEffect, useRef, useCallback, lazy, Suspense } from 
 import { useParams, useNavigate, Link } from "react-router-dom";
 import { useAuth } from "./AuthContext";
 import socketService from "../services/socketService";
+import { getApiUrl } from "../config";
+import { api } from "./api";
 import "../styles/components/ChatRoom.css";
 
 // Lazy load heavy components to avoid circular dependencies
@@ -16,26 +18,9 @@ const EmojiPicker = lazy(() => import('emoji-picker-react'));
 function ChatRoom() {
   const { roomId } = useParams();
   const navigate = useNavigate();
-  const { user: authUser, isAuthenticated } = useAuth();
+  const { user: sessionUser, isAuthenticated, loading: authLoading } = useAuth();
 
-  // Redirect to login if not authenticated (with delay to allow auth state to load)
-  useEffect(() => {
-    console.log('ChatRoom: Authentication check - isAuthenticated:', isAuthenticated, 'authUser:', authUser);
-    
-    // Add a small delay to allow authentication state to load on refresh
-    const authCheckTimeout = setTimeout(() => {
-      if (!isAuthenticated) {
-        console.log('ChatRoom: User not authenticated, redirecting to login');
-        navigate('/login');
-        return;
-      }
-    }, 1000); // 1 second delay
-
-    return () => clearTimeout(authCheckTimeout);
-  }, [isAuthenticated, navigate]);
-
-  // Show loading while authentication is being checked
-  if (!isAuthenticated) {
+  if (authLoading || !sessionUser) {
     return (
       <div className="loading">
         <div className="loading-spinner"></div>
@@ -46,22 +31,157 @@ function ChatRoom() {
 
   // Helper function to get user identifier consistently
   const getUserIdentifier = () => {
-    return authUser?.email || authUser?.username || 'Anonymous';
+    if (isAuthenticated && sessionUser?.username) return sessionUser.username;
+    if (isAuthenticated && sessionUser?.email) return sessionUser.email;
+    try {
+      const chatUser = JSON.parse(localStorage.getItem('chatUser') || '{}');
+      if (chatUser.username) return chatUser.username;
+    } catch {
+      // ignore parse errors
+    }
+    return sessionUser?.email || sessionUser?.username || 'Anonymous';
   };
+
+  const getMessageKey = (message) =>
+    message?.messageId || message?._id || message?.id || message?.createdAt || '';
 
   const getDisplayUsername = () => {
     // First check if user has a stored username
-    if (authUser?.username && authUser.username !== authUser.email) {
-      return authUser.username;
+    if (sessionUser?.username && sessionUser.username !== sessionUser.email) {
+      return sessionUser.username;
     }
     
     // If no username, extract from email (part before @)
-    if (authUser?.email) {
-      return authUser.email.split('@')[0];
+    if (sessionUser?.email) {
+      return sessionUser.email.split('@')[0];
     }
     
     // Fallback to stored username or Anonymous
-    return authUser?.username || 'Anonymous';
+    return sessionUser?.username || 'Anonymous';
+  };
+
+  const mapBackendRoom = (pin, data) => {
+    const r = data?.room || data;
+    if (!r) return null;
+    return {
+      id: pin,
+      name: r.name || pin,
+      createdBy: r.createdBy,
+      isPrivate: r.isPrivate || false,
+      password: r.password,
+      participants: r.uniqueParticipants || r.participants || [],
+      uniqueParticipants: r.uniqueParticipants || r.participants || [],
+      color: r.color || generateRandomColor(),
+      admins: r.admins || [],
+    };
+  };
+
+  const normalizeParticipant = (p) => {
+    if (typeof p === 'string') {
+      return { username: p, isCreator: false, color: '#6366f1' };
+    }
+    return {
+      ...p,
+      username: p?.username || p?.email || 'Unknown',
+      color: p?.color || '#6366f1',
+    };
+  };
+
+  const normalizeParticipants = (list) => {
+    if (!Array.isArray(list)) return [];
+    const seen = new Set();
+    const out = [];
+    list.forEach((p) => {
+      const normalized = normalizeParticipant(p);
+      if (normalized.username && !seen.has(normalized.username)) {
+        seen.add(normalized.username);
+        out.push(normalized);
+      }
+    });
+    return out;
+  };
+
+  const applyRoomToState = (pin, roomData) => {
+    if (!roomData) return [];
+    const participantList = normalizeParticipants(
+      roomData.uniqueParticipants || roomData.participants || []
+    ).map((p) => ({
+      ...p,
+      isCreator: p.username === roomData.createdBy,
+    }));
+    const stored = {
+      ...roomData,
+      id: pin,
+      participants: participantList,
+      uniqueParticipants: participantList,
+    };
+
+    const rooms = JSON.parse(localStorage.getItem('chatRooms') || '{}');
+    rooms[pin] = stored;
+    localStorage.setItem('chatRooms', JSON.stringify(rooms));
+
+    setRoomInfo(stored);
+    setParticipants(participantList);
+    setAllRoomsParticipants((prev) => ({ ...prev, [pin]: participantList }));
+    return participantList;
+  };
+
+  const refreshRoomParticipants = async (pin = roomId) => {
+    if (!pin) return;
+    try {
+      const { room: joinedRoom } = await joinRoomOnBackend(pin);
+      if (joinedRoom) {
+        applyRoomToState(pin, joinedRoom);
+        return;
+      }
+      const apiUrl = getApiUrl();
+      const userIdentifier = getUserIdentifier();
+      const response = await fetch(
+        `${apiUrl}/api/rooms/${encodeURIComponent(pin)}?username=${encodeURIComponent(userIdentifier)}`
+      );
+      if (response.ok) {
+        const data = await response.json();
+        applyRoomToState(pin, mapBackendRoom(pin, data.room));
+      }
+    } catch (err) {
+      console.warn('Could not refresh room members:', err);
+    }
+  };
+
+  const joinRoomOnBackend = async (pin) => {
+    const apiUrl = getApiUrl();
+    const userIdentifier = getUserIdentifier();
+    const response = await fetch(
+      `${apiUrl}/api/rooms/${encodeURIComponent(pin)}/join`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ username: userIdentifier }),
+      }
+    );
+
+    if (response.ok) {
+      const data = await response.json();
+      return { room: mapBackendRoom(pin, data.room || data), error: null };
+    }
+
+    const errBody = await response.json().catch(() => ({}));
+    if (response.status === 403) {
+      return {
+        room: null,
+        error:
+          errBody.error ||
+          errBody.message ||
+          'This room is private. Join from the home page with the password.',
+      };
+    }
+    if (response.status === 404) {
+      return { room: null, error: 'ROOM_NOT_FOUND' };
+    }
+    return {
+      room: null,
+      error: errBody.error || errBody.message || 'Could not join room',
+    };
   };
 
   // [All state variables and refs remain the same]
@@ -124,7 +244,9 @@ function ChatRoom() {
   const [codeToRun, setCodeToRun] = useState("");
   const [runLanguage, setRunLanguage] = useState("nodejs");
   const [runOutput, setRunOutput] = useState("");
+  const [runStdin, setRunStdin] = useState("");
   const [isRunning, setIsRunning] = useState(false);
+  const [jdoodleStatus, setJdoodleStatus] = useState(null);
   const [showCollaborativeEditor, setShowCollaborativeEditor] = useState(false);
   const [showVideoCall, setShowVideoCall] = useState(false);
   const [showMeetingScheduler, setShowMeetingScheduler] = useState(false);
@@ -168,8 +290,8 @@ function ChatRoom() {
 
   // Supported coding languages
   const codeLanguages = [
-    { id: "nodejs", name: "JavaScript" },
-    { id: "python", name: "Python" },
+    { id: "nodejs", name: "JavaScript (Node.js)" },
+    { id: "python", name: "Python 3" },
     { id: "java", name: "Java" },
     { id: "cpp", name: "C++" },
     { id: "csharp", name: "C#" },
@@ -179,8 +301,15 @@ function ChatRoom() {
     { id: "go", name: "Go" },
     { id: "typescript", name: "TypeScript" },
     { id: "html", name: "HTML" },
-    { id: "css", name: "CSS" },
   ];
+
+  useEffect(() => {
+    if (!executionMode) return;
+    fetch(`${getApiUrl()}/api/jdoodle/status`)
+      .then((r) => r.json())
+      .then(setJdoodleStatus)
+      .catch(() => setJdoodleStatus({ mode: "unknown" }));
+  }, [executionMode]);
 
   // Update roomOrder when joinedRooms changes
   useEffect(() => {
@@ -330,7 +459,7 @@ function ChatRoom() {
 
   // Socket.IO connection and real-time chat functionality
   useEffect(() => {
-    if (!authUser || !roomId) return;
+    if (!sessionUser || !roomId) return;
 
     // Load existing messages first
     const loadMessages = async () => {
@@ -344,10 +473,10 @@ function ChatRoom() {
       }, 10000); // 10 second timeout
       
       try {
-        const apiUrl = process.env.REACT_APP_API_URL || 'http://awsproject-backend-prod.eba-fphuu5yq.us-east-1.elasticbeanstalk.com';
+        const apiUrl = getApiUrl();
         console.log('Loading messages for room:', roomId);
         
-        const response = await fetch(`${apiUrl}/api/rooms/${roomId}/messages?username=${authUser?.email || authUser?.username}`, {
+        const response = await fetch(`${apiUrl}/api/rooms/${roomId}/messages?username=${sessionUser?.email || sessionUser?.username}`, {
           method: 'GET',
           headers: {
             'Accept': 'application/json',
@@ -362,15 +491,36 @@ function ChatRoom() {
           
           // Load admin permissions after successfully loading messages
           await loadAdminPermissions();
+        } else if (response.status === 403) {
+          console.log('Not a member yet — joining room on server...');
+          const { room: joinedRoom, error: joinError } = await joinRoomOnBackend(roomId);
+          if (joinedRoom) {
+            const retry = await fetch(
+              `${apiUrl}/api/rooms/${roomId}/messages?username=${encodeURIComponent(getUserIdentifier())}`
+            );
+            if (retry.ok) {
+              const existingMessages = await retry.json();
+              setMessages(Array.isArray(existingMessages) ? existingMessages : []);
+              await loadAdminPermissions();
+            } else {
+              setMessages([]);
+            }
+          } else if (joinError && joinError !== 'ROOM_NOT_FOUND') {
+            setError(joinError);
+          } else {
+            await createRoomIfNeeded();
+            setMessages([]);
+          }
         } else if (response.status === 404) {
-          // Room doesn't exist yet, create it and start with empty messages
           console.log('Room not found, creating room...');
           await createRoomIfNeeded();
           setMessages([]);
         } else {
-          // For server errors, try to create room and continue
-          console.warn('Server error loading messages, creating room as fallback...');
-          await createRoomIfNeeded();
+          console.warn('Server error loading messages, trying join/create...');
+          const { room: joinedRoom } = await joinRoomOnBackend(roomId);
+          if (!joinedRoom) {
+            await createRoomIfNeeded();
+          }
           setMessages([]);
         }
       } catch (error) {
@@ -390,23 +540,24 @@ function ChatRoom() {
 
     const createRoomIfNeeded = async () => {
       try {
-        // Check if user is authenticated before creating room
-        if (!isAuthenticated || !authUser) {
-          console.log('User not authenticated, cannot create room');
+        if (!sessionUser) {
+          console.log('No user session, cannot create room');
           return;
         }
-        
-        const apiUrl = process.env.REACT_APP_API_URL || 'http://awsproject-backend-prod.eba-fphuu5yq.us-east-1.elasticbeanstalk.com';
+
+        const { room: joinedRoom, error: joinError } = await joinRoomOnBackend(roomId);
+        if (joinedRoom) {
+          console.log('Joined existing room on server:', roomId);
+          return;
+        }
+        if (joinError && joinError !== 'ROOM_NOT_FOUND') {
+          return;
+        }
+
+        const apiUrl = getApiUrl();
         const userIdentifier = getUserIdentifier();
         console.log('Creating room:', roomId, 'for user:', userIdentifier);
-        
-        // First check if room already exists
-        const checkResponse = await fetch(`${apiUrl}/api/rooms/${roomId}?username=${userIdentifier}`);
-        if (checkResponse.ok) {
-          console.log('Room already exists, not creating duplicate');
-          return;
-        }
-        
+
         const response = await fetch(`${apiUrl}/api/rooms`, {
           method: 'POST',
           headers: {
@@ -459,9 +610,9 @@ function ChatRoom() {
     console.log('🏠 Joining room:', roomId, 'as user:', userIdentifier);
     const userForSocket = {
       username: userIdentifier,
-      email: authUser.email,
-      name: authUser.name,
-      color: authUser.color || '#007bff'
+      email: sessionUser.email,
+      name: sessionUser.name,
+      color: sessionUser.color || '#007bff'
     };
     socketService.joinRoom(roomId, userForSocket);
 
@@ -472,20 +623,27 @@ function ChatRoom() {
       
       setMessages(prevMessages => {
         // Check if message already exists to prevent duplicates
-        const messageExists = prevMessages.some(msg => msg._id === message._id || msg.id === message._id);
+        const messageExists = prevMessages.some(msg => {
+          const key = getMessageKey(msg);
+          const incoming = message._id || message.messageId || message.id;
+          return key && (key === incoming || msg._id === message._id);
+        });
         if (messageExists) {
           console.log('Message already exists, skipping duplicate');
           return prevMessages;
         }
         
-        // Ensure message has proper format
+        const msgId = message._id || message.messageId || message.id || Date.now().toString();
         const formattedMessage = {
           ...message,
-          id: message._id || message.id || Date.now().toString(),
+          id: msgId,
+          _id: msgId,
+          messageId: msgId,
           user: message.user || message.sender,
           sender: message.user || message.sender,
           senderName: message.user || message.sender,
           timestamp: message.createdAt || message.timestamp || new Date().toISOString(),
+          createdAt: message.createdAt || message.timestamp || new Date().toISOString(),
           isCode: !!(message.code || message.language)
         };
         
@@ -504,15 +662,18 @@ function ChatRoom() {
     });
 
     socketService.onUserJoined((data) => {
-      console.log('User joined:', data.user.username || data.user.email);
+      console.log('User joined:', data.user?.username || data.user?.email);
+      refreshRoomParticipants(roomId);
     });
 
     socketService.onUserLeft((data) => {
-      console.log('User left:', data.user.username || data.user.email);
+      console.log('User left:', data.user?.username || data.user?.email);
+      refreshRoomParticipants(roomId);
     });
 
     socketService.onRoomUsers((users) => {
       setOnlineUsers(users);
+      setOnlineUsersCount(users.length);
     });
 
     socketService.onUsersCount((count) => {
@@ -522,7 +683,7 @@ function ChatRoom() {
     // Listen for video call notifications
     socketService.on('video-call-started', (data) => {
       console.log('📹 Video call notification received:', data);
-      if (data.roomId === roomId && data.startedBy !== (user?.username || user?.email)) {
+      if (data.roomId === roomId && data.startedBy !== getUserIdentifier()) {
         // Only show notification if there's no active video call
         if (!activeVideoCall) {
           setVideoCallNotification({
@@ -576,27 +737,37 @@ function ChatRoom() {
       socketService.socket.on('message-deleted', (data) => {
         console.log('Message deleted via Socket.IO:', data);
         if (data.roomId === roomId) {
-          setMessages(prevMessages => 
-            prevMessages.filter(msg => msg._id !== data.messageId)
+          setMessages(prevMessages =>
+            prevMessages.filter(msg => {
+              const id = msg._id || msg.messageId || msg.id;
+              return id !== data.messageId;
+            })
           );
         }
       });
     }
 
+    // Keep member list in sync with server
+    refreshRoomParticipants(roomId);
+    const memberSyncInterval = setInterval(() => {
+      refreshRoomParticipants(roomId);
+    }, 8000);
+
     // Cleanup on unmount or room change
     return () => {
-      if (authUser && roomId) {
+      clearInterval(memberSyncInterval);
+      if (sessionUser && roomId) {
         const userForSocket = {
           username: getUserIdentifier(),
-          email: authUser.email,
-          name: authUser.name,
-          color: authUser.color || '#007bff'
+          email: sessionUser.email,
+          name: sessionUser.name,
+          color: sessionUser.color || '#007bff'
         };
         socketService.leaveRoom(roomId, userForSocket);
       }
-      socketService.removeAllListeners();
+      socketService.removeChatListeners();
     };
-  }, [authUser, roomId]);
+  }, [sessionUser, roomId]);
 
   // Handle Socket.IO connection status
   useEffect(() => {
@@ -608,7 +779,7 @@ function ChatRoom() {
       console.log('🔄 Socket connection status check:', isConnected);
       setSocketConnected(isConnected);
       
-      if (!isConnected && authUser && roomId) {
+      if (!isConnected && sessionUser && roomId) {
         console.log('⚠️ Socket disconnected, attempting to reconnect...');
         
         // Clear existing timeout
@@ -625,9 +796,9 @@ function ChatRoom() {
               if (socketService.isConnected()) {
                 const userForSocket = {
                   username: getUserIdentifier(),
-                  email: authUser.email,
-                  name: authUser.name,
-                  color: authUser.color || '#007bff'
+                  email: sessionUser.email,
+                  name: sessionUser.name,
+                  color: sessionUser.color || '#007bff'
                 };
                 socketService.joinRoom(roomId, userForSocket);
               }
@@ -653,7 +824,7 @@ function ChatRoom() {
         clearTimeout(reconnectTimeout);
       }
     };
-  }, [authUser, roomId]);
+  }, [sessionUser, roomId]);
 
   // Handle clicks outside the user menu
   useEffect(() => {
@@ -1003,27 +1174,18 @@ function ChatRoom() {
   useEffect(() => {
     const initializeRoom = async () => {
       // Check if user is authenticated first (with retry logic)
-      if (!isAuthenticated || !authUser) {
-        console.log('User not authenticated, waiting for auth state...');
-        // Wait a bit for auth state to load, then retry
-        setTimeout(() => {
-          if (!isAuthenticated || !authUser) {
-            console.log('User still not authenticated after retry, redirecting to home');
-            navigate("/");
-          }
-        }, 2000);
+      if (!sessionUser) {
         return;
       }
 
       const userData = localStorage.getItem("chatUser");
 
       if (!userData) {
-        // Create user data from auth user
         const newUserData = {
           username: getUserIdentifier(),
-          email: authUser.email,
-          name: authUser.name,
-          color: authUser.color || generateRandomColor(),
+          email: sessionUser.email || sessionUser.username,
+          name: sessionUser.name || sessionUser.username,
+          color: sessionUser.color || generateRandomColor(),
           roomId: roomId,
           joinedAt: new Date().toISOString()
         };
@@ -1032,23 +1194,17 @@ function ChatRoom() {
       } else {
         const parsedUser = JSON.parse(userData);
 
+        if (isAuthenticated && sessionUser?.username) {
+          parsedUser.username = sessionUser.username;
+        }
+
         // Assign a random color to the user if they don't have one
         if (!parsedUser.color) {
           parsedUser.color = generateRandomColor();
-          localStorage.setItem("chatUser", JSON.stringify(parsedUser));
         }
 
-        if (parsedUser.roomId !== roomId) {
-          // Update the active room
-          localStorage.setItem(
-            "chatUser",
-            JSON.stringify({
-              ...parsedUser,
-              roomId,
-            })
-          );
-        }
-
+        parsedUser.roomId = roomId;
+        localStorage.setItem("chatUser", JSON.stringify(parsedUser));
         setUser(parsedUser);
       }
 
@@ -1060,39 +1216,25 @@ function ChatRoom() {
       const rooms = JSON.parse(localStorage.getItem("chatRooms") || "{}");
       let room = rooms[roomId];
 
-      // If not found in localStorage, try to fetch from backend
-      if (!room) {
-        console.log('Room not found in localStorage, checking backend...');
-        try {
-          const apiUrl = process.env.REACT_APP_API_URL || 'http://awsproject-backend-prod.eba-fphuu5yq.us-east-1.elasticbeanstalk.com';
-          const response = await fetch(`${apiUrl}/api/rooms/${roomId}?username=${authUser?.email || authUser?.username}`);
-          
-          if (response.ok) {
-            const roomData = await response.json();
-            room = {
-              id: roomId,
-              name: roomData.name,
-              createdBy: roomData.createdBy,
-              isPrivate: roomData.isPrivate || false,
-              password: roomData.password,
-              participants: roomData.participants || [],
-              color: roomData.color || generateRandomColor()
-            };
-            console.log('Room found in backend:', room);
-            
-            // Save to localStorage for future use
-            rooms[roomId] = room;
-            localStorage.setItem("chatRooms", JSON.stringify(rooms));
-          } else {
-            console.log('Room not found in backend either');
-          }
-        } catch (error) {
-          console.error('Error fetching room from backend:', error);
+      // Always sync membership from server (localStorage is often stale)
+      const { room: syncedRoom, error: syncError } = await joinRoomOnBackend(roomId);
+      if (syncedRoom) {
+        room = syncedRoom;
+        rooms[roomId] = syncedRoom;
+        localStorage.setItem('chatRooms', JSON.stringify(rooms));
+      } else if (!room) {
+        console.log('Room not on server — trying local cache...');
+        if (syncError && syncError !== 'ROOM_NOT_FOUND') {
+          setError(syncError);
+          setLoading(false);
+          return;
         }
       }
 
       if (!room) {
-        setError("Room not found. The room may have been deleted or the PIN is incorrect.");
+        setError(
+          `Room "${roomId}" not found. Use the exact 4-digit PIN from the person who created the room, or create a new room on the home page.`
+        );
         setLoading(false);
         return;
       }
@@ -1105,8 +1247,13 @@ function ChatRoom() {
       }
 
       setRoomInfo(room);
-      // Use unique participants if available, otherwise fall back to regular participants
-      setParticipants(room.uniqueParticipants || room.participants || []);
+    const participantList = normalizeParticipants(
+      room.uniqueParticipants || room.participants || []
+    ).map((p) => ({
+      ...p,
+      isCreator: p.username === room.createdBy,
+    }));
+    setParticipants(participantList);
       
       // Check if current user is admin
       const currentUsername = getUserIdentifier();
@@ -1124,6 +1271,18 @@ function ChatRoom() {
         isAdmin
       });
       setIsUserAdmin(isAdmin);
+      if (isAdmin) {
+        setAdminPermissions({
+          isAdmin: true,
+          isCreator:
+            room.createdBy === currentUsername ||
+            room.createdBy === displayUsername,
+          canDeleteMessages: true,
+          canRemoveMembers: true,
+          canManageAdmins: true,
+          canEditRoomSettings: true,
+        });
+      }
 
       // Get participants for all rooms
       const roomParticipantsMap = {};
@@ -1147,8 +1306,8 @@ function ChatRoom() {
       if (localMessages.length === 0) {
         console.log('No local messages found, fetching from backend...');
         try {
-          const apiUrl = process.env.REACT_APP_API_URL || 'http://awsproject-backend-prod.eba-fphuu5yq.us-east-1.elasticbeanstalk.com';
-          const messagesResponse = await fetch(`${apiUrl}/api/rooms/${roomId}/messages?username=${authUser?.email || authUser?.username}`);
+          const apiUrl = getApiUrl();
+          const messagesResponse = await fetch(`${apiUrl}/api/rooms/${roomId}/messages?username=${sessionUser?.email || sessionUser?.username}`);
           
           if (messagesResponse.ok) {
             const backendMessages = await messagesResponse.json();
@@ -1157,8 +1316,9 @@ function ChatRoom() {
             if (backendMessages.length > 0) {
               // Convert backend messages to frontend format
               roomMessages = backendMessages.map(msg => ({
-                id: msg._id,
-                _id: msg._id,
+                id: msg.messageId || msg._id,
+                _id: msg.messageId || msg._id,
+                messageId: msg.messageId || msg._id,
                 text: msg.text || '',
                 code: msg.code || '',
                 language: msg.language || '',
@@ -1168,8 +1328,8 @@ function ChatRoom() {
                 createdAt: msg.createdAt || new Date().toISOString(),
                 room: roomId,
                 isCode: !!(msg.code || msg.language),
-                sender: msg.user, // Add for compatibility
-                senderName: msg.user // Add for compatibility
+                sender: msg.user,
+                senderName: msg.user,
               }));
               
               // Save to localStorage for future use
@@ -1203,7 +1363,7 @@ function ChatRoom() {
 
       setLoading(false);
 
-      // Set up polling for new messages and participants (simulating real-time)
+      // Set up polling for new messages (participants sync via socket + separate interval)
       messagePollingRef.current = setInterval(() => {
         const updatedMessages =
           JSON.parse(localStorage.getItem("chatMessages") || "{}")[roomId] || [];
@@ -1474,7 +1634,7 @@ function ChatRoom() {
     if (!messageInput.trim() && !fileInputRef.current?.files?.length) return;
     
     // Check if user is authenticated
-    if (!authUser) {
+    if (!sessionUser) {
       setError('Please log in to send messages');
       return;
     }
@@ -1483,9 +1643,9 @@ function ChatRoom() {
       roomId,
       user: {
         username: getDisplayUsername(),
-        email: authUser.email,
-        name: authUser.name,
-        color: authUser.color || '#007bff'
+        email: sessionUser.email,
+        name: sessionUser.name,
+        color: sessionUser.color || '#007bff'
       },
       text: messageInput,
       code: isCodeOn ? messageInput : null,
@@ -1524,7 +1684,7 @@ function ChatRoom() {
     if (!messageSent) {
       console.log('Socket.IO not available, using REST API fallback');
       try {
-        const apiUrl = process.env.REACT_APP_API_URL || 'http://awsproject-backend-prod.eba-fphuu5yq.us-east-1.elasticbeanstalk.com';
+        const apiUrl = getApiUrl();
         const response = await fetch(`${apiUrl}/api/rooms/${roomId}/messages`, {
           method: 'POST',
           headers: {
@@ -1540,21 +1700,24 @@ function ChatRoom() {
         });
 
         if (response.ok) {
-          const newMessage = await response.json();
-          // Format message for local display
+          const data = await response.json();
+          const saved = data.message || data;
+          const msgId = saved.messageId || saved._id || saved.id;
           const formattedMessage = {
-            ...newMessage,
-            id: newMessage._id,
-            user: newMessage.user,
-            sender: newMessage.user,
-            senderName: newMessage.user,
-            timestamp: newMessage.createdAt,
-            isCode: !!(newMessage.code || newMessage.language)
+            ...saved,
+            id: msgId,
+            _id: msgId,
+            messageId: msgId,
+            user: saved.user,
+            sender: saved.user,
+            senderName: saved.user,
+            timestamp: saved.createdAt,
+            createdAt: saved.createdAt,
+            isCode: !!(saved.code || saved.language),
           };
           
           setMessages(prevMessages => {
-            // Check if message already exists
-            const exists = prevMessages.some(msg => msg._id === newMessage._id || msg.id === newMessage._id);
+            const exists = prevMessages.some(msg => getMessageKey(msg) === msgId);
             if (!exists) {
               return [...prevMessages, formattedMessage];
             }
@@ -1629,7 +1792,7 @@ function ChatRoom() {
   // Load admin permissions for the current user
   const loadAdminPermissions = async () => {
     try {
-      const apiUrl = process.env.REACT_APP_API_URL || 'http://awsproject-backend-prod.eba-fphuu5yq.us-east-1.elasticbeanstalk.com';
+      const apiUrl = getApiUrl();
       const username = getUserIdentifier();
       
       const response = await fetch(`${apiUrl}/api/rooms/${roomId}/permissions/${username}`);
@@ -1646,20 +1809,22 @@ function ChatRoom() {
   // Handle message deletion
   const handleDeleteMessage = async (messageId) => {
     try {
-      // Remove the message from local state immediately for better UX
-      setMessages(prevMessages => prevMessages.filter(msg => msg._id !== messageId));
-      
-      // Emit socket event to notify other users
+      setMessages(prevMessages =>
+        prevMessages.filter(msg => {
+          const id = msg._id || msg.messageId || msg.id;
+          return id !== messageId;
+        })
+      );
+
       if (socketService.socket) {
         socketService.socket.emit('message-deleted', {
           roomId,
           messageId,
-          deletedBy: getUserIdentifier()
+          deletedBy: getUserIdentifier(),
         });
       }
     } catch (error) {
       console.error('Error handling message deletion:', error);
-      // Reload messages if there's an error
       loadMessages();
     }
   };
@@ -1669,8 +1834,8 @@ function ChatRoom() {
     const newValue = e.target.value;
 
     // Send typing indicator
-    if (authUser && roomId && socketService.isConnected()) {
-      socketService.sendTyping(roomId, authUser, newValue.length > 0);
+    if (sessionUser && roomId && socketService.isConnected()) {
+      socketService.sendTyping(roomId, sessionUser, newValue.length > 0);
     }
 
     // Special check for @ removal - explicitly handle this case
@@ -1909,18 +2074,6 @@ function ChatRoom() {
     return <div className="loading">Loading chat room...</div>;
   }
 
-  if (!authUser) {
-    return (
-      <div className="error-container">
-        <h2>Authentication Required</h2>
-        <p>Please log in to access the chat room.</p>
-        <button onClick={() => navigate('/')} className="home-button">
-          Back to Home
-        </button>
-      </div>
-    );
-  }
-
   if (error) {
     return (
       <div className="error-container">
@@ -2025,24 +2178,21 @@ function ChatRoom() {
           </button>
     <button 
       onClick={() => {
+        const peerId = getUserIdentifier();
         if (activeVideoCall) {
-          // If there's already an active video call, just join it
           setShowVideoCall(true);
           console.log('📹 Joining existing video call');
         } else {
-          // Start new video call
           setShowVideoCall(true);
           setActiveVideoCall(true);
-          // Notify other users that a video call has started
           socketService.emit('video-call-started', {
-            roomId: roomId,
-            startedBy: user?.username || user?.email,
-            timestamp: Date.now()
+            roomId,
+            startedBy: peerId,
+            timestamp: Date.now(),
           });
-          // Notify that video call is now active
           socketService.emit('video-call-active', {
-            roomId: roomId,
-            active: true
+            roomId,
+            active: true,
           });
           console.log('📹 Starting new video call');
         }
@@ -2372,9 +2522,9 @@ function ChatRoom() {
               className="user-menu-button"
               onClick={() => setUserDropupOpen(!userDropupOpen)}
             >
-              {isAuthenticated && authUser?.avatar ? (
+              {isAuthenticated && sessionUser?.avatar ? (
                 <img
-                  src={authUser.avatar}
+                  src={sessionUser.avatar}
                   alt="Profile"
                   className="user-avatar"
                 />
@@ -2395,7 +2545,7 @@ function ChatRoom() {
               style={{ color: user?.color || "rgba(255, 255, 255, 0.9)" }}
             >
               {isAuthenticated
-                ? authUser?.name || user?.username
+                ? sessionUser?.name || user?.username
                 : user?.username}
             </div>
 
@@ -2403,10 +2553,10 @@ function ChatRoom() {
               <div className="sidebar-dropup-menu">
                 <div className="sidebar-user-info">
                   <div className="user-name">
-                    {isAuthenticated ? authUser?.name : user?.username}
+                    {isAuthenticated ? sessionUser?.name : user?.username}
                   </div>
                   {isAuthenticated && (
-                    <div className="user-email">{authUser?.email}</div>
+                    <div className="user-email">{sessionUser?.email}</div>
                   )}
                 </div>
 
@@ -2471,6 +2621,15 @@ function ChatRoom() {
 
             {executionMode && (
               <div style={{ marginBottom: '1rem', background: '#222', padding: '1rem', borderRadius: '8px' }}>
+                {jdoodleStatus && (
+                  <p style={{ color: jdoodleStatus.configured ? '#6f6' : '#fa0', fontSize: '0.85rem', marginBottom: '0.75rem' }}>
+                    {jdoodleStatus.configured
+                      ? 'JDoodle connected — all languages supported'
+                      : jdoodleStatus.mode === 'local-fallback'
+                        ? 'Local runner — Node.js & Python only (add JDoodle keys for Java, C++, etc.)'
+                        : 'Code execution not configured'}
+                  </p>
+                )}
                 <div style={{ marginBottom: '0.5rem' }}>
                   <label style={{ color: '#fff', marginRight: '0.5rem' }}>Language:</label>
                   <select value={runLanguage} onChange={e => setRunLanguage(e.target.value)}>
@@ -2486,19 +2645,30 @@ function ChatRoom() {
                   rows={8}
                   style={{ width: '100%', fontFamily: 'monospace', fontSize: '1rem', background: '#1a1a1a', color: '#fff', border: '1px solid #444', borderRadius: '4px', marginBottom: '0.5rem' }}
                 />
+                <div style={{ marginBottom: '0.5rem' }}>
+                  <label style={{ color: '#fff', display: 'block', marginBottom: '0.25rem' }}>
+                    Standard Input (for input(), scanf(), etc.):
+                  </label>
+                  <textarea
+                    value={runStdin}
+                    onChange={e => setRunStdin(e.target.value)}
+                    placeholder="e.g. 5"
+                    rows={2}
+                    style={{ width: '100%', fontFamily: 'monospace', fontSize: '1rem', background: '#1a1a1a', color: '#fff', border: '1px solid #444', borderRadius: '4px' }}
+                  />
+                </div>
                 <button
                   onClick={async () => {
                     setIsRunning(true);
                     setRunOutput("");
                     try {
-                      const apiUrl = process.env.REACT_APP_API_URL || 'http://awsproject-backend-prod.eba-fphuu5yq.us-east-1.elasticbeanstalk.com';
-                      const res = await fetch(`${apiUrl}/api/jdoodle/execute`, {
-                        method: "POST",
-                        headers: { "Content-Type": "application/json" },
-                        body: JSON.stringify({ code: codeToRun, language: runLanguage })
+                      const data = await api.executeCode({
+                        code: codeToRun,
+                        language: runLanguage,
+                        stdin: runStdin,
                       });
-                      const data = await res.json();
-                      setRunOutput(data.output || data.error || JSON.stringify(data));
+                      const sourceNote = data.source ? `\n[${data.source}${data.fallback ? ', fallback' : ''}]` : '';
+                      setRunOutput((data.output || data.error || JSON.stringify(data)) + sourceNote);
                     } catch (err) {
                       setRunOutput("Error: " + err.message);
                     }
@@ -2536,10 +2706,7 @@ function ChatRoom() {
                       message={message}
                     isCurrentUser={message.user === (user?.username || user?.email || getUserIdentifier())}
                     onTagMessage={handleTagMessage}
-                    isHovered={
-                      hoveredMessageId ===
-                      (message.id || new Date(message.timestamp).getTime())
-                    }
+                    isHovered={hoveredMessageId === getMessageKey(message)}
                     isHighlighted={highlightedMessageIds.includes(
                       message.id || new Date(message.timestamp).getTime()
                     )}
@@ -2893,6 +3060,7 @@ function ChatRoom() {
           <VideoCall
             roomId={roomId}
             participants={participants}
+            onlineUsers={onlineUsers}
           onClose={() => {
             setShowVideoCall(false);
             // Notify that video call is no longer active
@@ -2928,6 +3096,7 @@ function ChatRoom() {
                 className="join-video-btn"
                 onClick={() => {
                   setShowVideoCall(true);
+                  setActiveVideoCall(true);
                   setVideoCallNotification(null);
                 }}
               >
@@ -2951,8 +3120,10 @@ function ChatRoom() {
             participants={participants}
           onClose={() => setShowMeetingScheduler(false)}
           onMeetingCreated={(meeting) => {
-            console.log('Meeting created:', meeting);
             setShowMeetingScheduler(false);
+            if (meeting?.meetingId) {
+              window.open(`/meet/${meeting.meetingId}`, '_blank', 'noopener,noreferrer');
+            }
           }}
         />
         </Suspense>

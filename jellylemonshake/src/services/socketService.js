@@ -5,43 +5,12 @@ class SocketService {
   constructor() {
     this.socket = null;
     this.connected = false;
+    this._coreHandlersBound = false;
   }
 
-  connect() {
-    if (this.socket && this.socket.connected) {
-      console.log('Socket already connected');
-      return this.socket;
-    }
-
-    if (this.socket) {
-      this.socket.disconnect();
-    }
-
-    const serverUrl = getSocketUrl();
-    console.log('Connecting to Socket.IO server:', serverUrl);
-    
-    // Add error handling for connection failures
-    if (!serverUrl || serverUrl.includes('localhost:8492')) {
-      console.error('Invalid server URL detected:', serverUrl);
-      return null;
-    }
-    
-    this.socket = io(serverUrl, {
-      transports: ['polling', 'websocket'], // Try polling first, then websocket
-      upgrade: true,
-      rememberUpgrade: false,
-      timeout: config.socketTimeout || 20000,
-      reconnection: true,
-      reconnectionDelay: config.socketReconnectionDelay || 1000,
-      reconnectionDelayMax: 5000,
-      reconnectionAttempts: config.socketReconnectionAttempts || 5,
-      maxReconnectionAttempts: config.socketReconnectionAttempts || 5,
-      forceNew: true,
-      autoConnect: true,
-      secure: serverUrl.startsWith('https'), // Use secure connection only for HTTPS
-      rejectUnauthorized: false,
-      withCredentials: true
-    });
+  _attachCoreHandlers() {
+    if (!this.socket || this._coreHandlersBound) return;
+    this._coreHandlersBound = true;
 
     this.socket.on('connect', () => {
       console.log('✅ Connected to Socket.IO server');
@@ -51,8 +20,6 @@ class SocketService {
     this.socket.on('disconnect', (reason) => {
       console.log('❌ Disconnected from Socket.IO server:', reason);
       this.connected = false;
-      
-      // Don't auto-reconnect on certain disconnect reasons
       if (reason === 'io server disconnect') {
         console.log('Server disconnected, manual reconnection needed');
       }
@@ -61,14 +28,6 @@ class SocketService {
     this.socket.on('connect_error', (error) => {
       console.error('🔥 Socket.IO connection error:', error.message);
       this.connected = false;
-      
-      // Log more details about the error
-      console.error('Error details:', {
-        message: error.message,
-        description: error.description,
-        context: error.context,
-        type: error.type
-      });
     });
 
     this.socket.on('reconnect', (attemptNumber) => {
@@ -84,7 +43,45 @@ class SocketService {
       console.error('🔄❌ All reconnection attempts failed');
       this.connected = false;
     });
+  }
 
+  connect() {
+    if (this.socket?.connected) {
+      this.connected = true;
+      return this.socket;
+    }
+
+    const serverUrl = getSocketUrl();
+    console.log('Connecting to Socket.IO server:', serverUrl);
+
+    if (!serverUrl || serverUrl.includes('localhost:8492')) {
+      console.error('Invalid server URL detected:', serverUrl);
+      return null;
+    }
+
+    if (this.socket) {
+      this._attachCoreHandlers();
+      this.socket.connect();
+      return this.socket;
+    }
+
+    this.socket = io(serverUrl, {
+      transports: ['polling', 'websocket'],
+      upgrade: true,
+      rememberUpgrade: false,
+      timeout: config.socketTimeout || 20000,
+      reconnection: true,
+      reconnectionDelay: config.socketReconnectionDelay || 1000,
+      reconnectionDelayMax: 5000,
+      reconnectionAttempts: config.socketReconnectionAttempts || 5,
+      maxReconnectionAttempts: config.socketReconnectionAttempts || 5,
+      autoConnect: true,
+      secure: serverUrl.startsWith('https'),
+      rejectUnauthorized: false,
+      withCredentials: true,
+    });
+
+    this._attachCoreHandlers();
     return this.socket;
   }
 
@@ -93,6 +90,7 @@ class SocketService {
       this.socket.disconnect();
       this.socket = null;
       this.connected = false;
+      this._coreHandlersBound = false;
     }
   }
 
@@ -182,16 +180,67 @@ class SocketService {
     }
   }
 
-  // Remove all listeners
+  // Remove chat/event listeners only — keep core connection handlers
+  removeChatListeners() {
+    if (!this.socket) return;
+    const events = [
+      'new-message',
+      'user-joined',
+      'user-left',
+      'room-users',
+      'users-count',
+      'user-typing',
+      'error',
+      'message-deleted',
+      'video-call-started',
+      'video-call-active',
+      'webrtc-offer',
+      'webrtc-answer',
+      'webrtc-ice-candidate',
+      'user-joined-video',
+      'user-left-video',
+      'video-participants',
+    ];
+    events.forEach((event) => this.socket.off(event));
+  }
+
+  // Remove all listeners (use sparingly — prefer removeChatListeners)
   removeAllListeners() {
     if (this.socket) {
       this.socket.removeAllListeners();
+      this._coreHandlersBound = false;
+      this.connected = !!this.socket.connected;
+      this._attachCoreHandlers();
     }
+  }
+
+  onConnectionChange(callback) {
+    this.connect();
+    const sync = () => callback(this.isConnected());
+    sync();
+    if (this.socket) {
+      this.socket.on('connect', sync);
+      this.socket.on('disconnect', sync);
+      this.socket.on('reconnect', sync);
+    }
+    return () => {
+      if (this.socket) {
+        this.socket.off('connect', sync);
+        this.socket.off('disconnect', sync);
+        this.socket.off('reconnect', sync);
+      }
+    };
   }
 
   // Check if connected
   isConnected() {
-    return this.connected && this.socket && this.socket.connected;
+    const live = !!(this.socket && this.socket.connected);
+    this.connected = live;
+    return live;
+  }
+
+  getSocketId() {
+    return this.socket?.id || null;
   }
 
   // Generic event listener

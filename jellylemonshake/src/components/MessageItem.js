@@ -2,6 +2,8 @@ import React, { useState, useRef, useEffect } from "react";
 import { Light as SyntaxHighlighter } from "react-syntax-highlighter";
 import { dracula } from "react-syntax-highlighter/dist/esm/styles/hljs";
 import { useAuth } from "./AuthContext";
+import { getApiUrl } from "../config";
+import { api } from "./api";
 import "../styles/components/MessageItem.css";
 
 // Import language support
@@ -57,14 +59,12 @@ function MessageItem({
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
 
   // Helper function to get user identifier consistently
-  const getUserIdentifier = () => {
-    return authUser?.email || authUser?.username || user?.email || user?.username || 'Anonymous';
-  };
+  const getUserIdentifier = () =>
+    user?.username || user?.email || authUser?.username || authUser?.email || 'Anonymous';
   // Add state to store code execution output
   const [outputLines, setOutputLines] = useState([]);
-  // Add state for user input in terminal
+  const [codeStdin, setCodeStdin] = useState("");
   const [userInput, setUserInput] = useState("");
-  // Add state to track if code needs input
   const [awaitingInput, setAwaitingInput] = useState(false);
   // Reference for terminal input
   const terminalInputRef = useRef(null);
@@ -72,6 +72,12 @@ function MessageItem({
   const outputContainerRef = useRef(null);
   // Add this for message animation reference
   const messageRef = useRef(null);
+
+  const messageKey =
+    message.messageId || message._id || message.id || message.createdAt || '';
+
+  const [isLocalHovered, setIsLocalHovered] = useState(false);
+  const showActions = isLocalHovered || isHovered;
 
   // Scroll to bottom of output whenever it changes
   useEffect(() => {
@@ -94,7 +100,7 @@ function MessageItem({
       void messageRef.current.offsetWidth; // Trigger reflow
       messageRef.current.style.animation = "";
     }
-  }, [message.id]);
+  }, [messageKey]);
 
   // Function to handle code copying
   const copyCodeToClipboard = () => {
@@ -109,99 +115,70 @@ function MessageItem({
       });
   };
 
-  // Function to execute code - uses the actual code from message.text
-  const executeCode = async () => {
-    if (showOutput) {
-      // Switch back to code view
-      setShowOutput(false);
-      return;
-    }
+  const messageNeedsStdin = (text) => /\binput\s*\(/.test(text || "") || /\bscanf\s*\(/.test(text || "");
 
-    // Start execution
+  const runCode = async (stdin = codeStdin) => {
     setExecutingCode(true);
-    setOutputLines([
-      { text: `Compiling ${message.language} code...`, type: "info" },
-    ]);
+    setAwaitingInput(false);
+    setOutputLines([{ text: `Running ${message.language} code...`, type: "info" }]);
     setShowOutput(true);
 
     try {
-      const codeToExecute = message.text;
-      console.log(`🚀 Executing ${message.language} code:`, codeToExecute);
-
-      // Call the backend API for code execution
-      const apiUrl = process.env.REACT_APP_API_URL || 'http://awsproject-backend-prod.eba-fphuu5yq.us-east-1.elasticbeanstalk.com';
-      const response = await fetch(`${apiUrl}/api/jdoodle/execute`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          code: codeToExecute,
-          language: message.language
-        })
+      const result = await api.executeCode({
+        code: message.text,
+        language: message.language,
+        stdin,
       });
 
-      if (!response.ok) {
-        throw new Error(`HTTP error! status: ${response.status}`);
+      if (result.needsStdin) {
+        setAwaitingInput(true);
+        setOutputLines([
+          { text: result.output, type: "info" },
+        ]);
+        setExecutingCode(false);
+        return;
       }
 
-      const result = await response.json();
-      console.log('📋 Execution result:', result);
-
-      // Display the output
       if (result.output) {
         setOutputLines([
-          { text: `✅ Execution completed`, type: "success" },
+          { text: "Execution completed", type: "success" },
+          ...(result.source ? [{ text: `via ${result.source}${result.fallback ? " (fallback)" : ""}`, type: "info" }] : []),
           { text: "Output:", type: "info" },
           { text: result.output, type: "output" },
           ...(result.memory ? [{ text: `Memory: ${result.memory}`, type: "info" }] : []),
-          ...(result.cpuTime ? [{ text: `CPU Time: ${result.cpuTime}`, type: "info" }] : [])
+          ...(result.cpuTime ? [{ text: `CPU Time: ${result.cpuTime}`, type: "info" }] : []),
         ]);
       } else if (result.error) {
         setOutputLines([
-          { text: "❌ Execution failed", type: "error" },
-          { text: result.error, type: "error" }
+          { text: "Execution failed", type: "error" },
+          { text: result.error, type: "error" },
         ]);
       }
 
       setExecutingCode(false);
-
     } catch (error) {
-      console.error('Error executing code:', error);
       setOutputLines([
-        { text: "❌ Error executing code", type: "error" },
+        { text: "Error executing code", type: "error" },
         { text: error.message, type: "error" },
-        { text: "Make sure the backend server is running and JDoodle API is configured.", type: "info" }
       ]);
       setExecutingCode(false);
     }
   };
 
-  // Handle user input submission
+  const executeCode = async () => {
+    if (showOutput) {
+      setShowOutput(false);
+      return;
+    }
+    await runCode();
+  };
+
   const handleInputSubmit = (e) => {
     e.preventDefault();
-
-    if (!userInput.trim()) return;
-
-    // Add user input to output display
-    setOutputLines((prev) => [
-      ...prev,
-      {
-        text: `> ${userInput}`,
-        type: "command",
-      },
-    ]);
-
-    // For demo, just acknowledge the input
-    setOutputLines((prev) => [
-      ...prev,
-      {
-        text: `Input "${userInput}" sent to the program`,
-        type: "info",
-      },
-    ]);
-
-    // Clear input field
+    const stdin = userInput.trim() || codeStdin.trim();
+    if (!stdin) return;
+    setCodeStdin(stdin);
+    runCode(stdin);
     setUserInput("");
   };
 
@@ -209,8 +186,9 @@ function MessageItem({
   const handleDeleteMessage = async () => {
     if (window.confirm('Are you sure you want to delete this message? This action cannot be undone.')) {
       try {
-        const apiUrl = process.env.REACT_APP_API_URL || 'http://awsproject-backend-prod.eba-fphuu5yq.us-east-1.elasticbeanstalk.com';
-        const response = await fetch(`${apiUrl}/api/rooms/${roomId}/messages/${message._id}`, {
+        const apiUrl = getApiUrl();
+        const messageId = messageKey;
+        const response = await fetch(`${apiUrl}/api/rooms/${roomId}/messages/${messageId}`, {
           method: 'DELETE',
           headers: {
             'Content-Type': 'application/json'
@@ -223,7 +201,7 @@ function MessageItem({
         if (response.ok) {
           // Call the parent component's delete handler
           if (onDeleteMessage) {
-            onDeleteMessage(message._id);
+            onDeleteMessage(messageId);
           }
         } else {
           const errorData = await response.json();
@@ -245,8 +223,6 @@ function MessageItem({
       })
     : "";
 /*sohamghosh-jellylemonshake-23bps1146 */
-  // Generate a unique ID for the message if it doesn't have one
-  const messageId = message.id || new Date(message.timestamp).getTime();
 
   // Function to format message text with mentions
   const formatMessageWithMentions = (text) => {
@@ -287,12 +263,18 @@ function MessageItem({
   return (
     <div
       className={`message-item ${isCurrentUser ? "current-user" : ""} ${
-        isHovered ? "hovered" : ""
+        showActions ? "hovered" : ""
       } ${isHighlighted ? "highlighted" : ""} ${
         isActiveHighlight ? "active-highlight" : ""
       } ${message.local ? "local" : ""}`}
-      onMouseEnter={() => onMouseEnter(messageId)}
-      onMouseLeave={onMouseLeave}
+      onMouseEnter={() => {
+        setIsLocalHovered(true);
+        onMouseEnter(messageKey);
+      }}
+      onMouseLeave={() => {
+        setIsLocalHovered(false);
+        onMouseLeave();
+      }}
     >
       {/*sohamghosh-jellylemonshake-23bps1146 *//* Always show sender name above message bubble */}
       <div
@@ -326,7 +308,7 @@ function MessageItem({
         }}
       >
         {/* Show tag button when hovered - MOVED INSIDE THE MESSAGE BUBBLE */}
-        {isHovered && (
+        {showActions && (
           <button
             className="tag-button"
             onClick={() => onTagMessage(message)}
@@ -349,7 +331,7 @@ function MessageItem({
         )}
 
         {/* Show delete button for admins when hovered */}
-        {isHovered && canDeleteMessages && (
+        {showActions && canDeleteMessages && (
           <button
             className="delete-button"
             onClick={handleDeleteMessage}
@@ -469,6 +451,23 @@ function MessageItem({
                         </div>
                       ))}
                     </div>
+
+                    {messageNeedsStdin(message.text) && !executingCode && (
+                      <div className="terminal-input-container" style={{ flexDirection: 'column', alignItems: 'stretch', gap: '0.5rem', marginBottom: '0.5rem' }}>
+                        <label style={{ fontSize: '0.85rem', opacity: 0.85 }}>Standard input:</label>
+                        <textarea
+                          className="terminal-input"
+                          value={codeStdin}
+                          onChange={(e) => setCodeStdin(e.target.value)}
+                          placeholder="e.g. 5"
+                          rows={2}
+                          style={{ width: '100%', resize: 'vertical' }}
+                        />
+                        <button type="button" className="terminal-submit" onClick={() => runCode(codeStdin)}>
+                          Run with input
+                        </button>
+                      </div>
+                    )}
 
                     {awaitingInput && (
                       <form

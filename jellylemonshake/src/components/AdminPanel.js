@@ -1,5 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { useAuth } from './AuthContext';
+import { getApiUrl } from '../config';
 import '../styles/components/AdminPanel.css';
 
 function AdminPanel({ roomId, onClose, isVisible }) {
@@ -23,9 +24,8 @@ function AdminPanel({ roomId, onClose, isVisible }) {
   const [inviteAdminUsername, setInviteAdminUsername] = useState('');
 
   // Helper function to get user identifier consistently
-  const getUserIdentifier = () => {
-    return authUser?.email || authUser?.username || user?.email || user?.username || 'Anonymous';
-  };
+  const getUserIdentifier = () =>
+    user?.username || user?.email || authUser?.username || authUser?.email || 'Anonymous';
 
   // Load room members and admin info
   useEffect(() => {
@@ -39,7 +39,7 @@ function AdminPanel({ roomId, onClose, isVisible }) {
     setLoading(true);
     setError('');
     try {
-      const apiUrl = process.env.REACT_APP_API_URL || 'http://awsproject-backend-prod.eba-fphuu5yq.us-east-1.elasticbeanstalk.com';
+      const apiUrl = getApiUrl();
       const username = getUserIdentifier();
       console.log('Loading room info for:', roomId, 'as user:', username);
       
@@ -66,7 +66,7 @@ function AdminPanel({ roomId, onClose, isVisible }) {
 
   const deleteMessage = async (messageId) => {
     try {
-      const apiUrl = process.env.REACT_APP_API_URL || 'http://awsproject-backend-prod.eba-fphuu5yq.us-east-1.elasticbeanstalk.com';
+      const apiUrl = getApiUrl();
       const response = await fetch(`${apiUrl}/api/rooms/${roomId}/messages/${messageId}`, {
         method: 'DELETE',
         headers: {
@@ -89,7 +89,7 @@ function AdminPanel({ roomId, onClose, isVisible }) {
   const removeMember = async (username) => {
     if (window.confirm(`Are you sure you want to remove ${username} from this room?`)) {
       try {
-        const apiUrl = process.env.REACT_APP_API_URL || 'http://awsproject-backend-prod.eba-fphuu5yq.us-east-1.elasticbeanstalk.com';
+        const apiUrl = getApiUrl();
         const response = await fetch(`${apiUrl}/api/rooms/${roomId}/members/${username}`, {
           method: 'DELETE',
           headers: {
@@ -113,7 +113,7 @@ function AdminPanel({ roomId, onClose, isVisible }) {
 
   const promoteToAdmin = async (username) => {
     try {
-      const apiUrl = process.env.REACT_APP_API_URL || 'http://awsproject-backend-prod.eba-fphuu5yq.us-east-1.elasticbeanstalk.com';
+      const apiUrl = getApiUrl();
       const response = await fetch(`${apiUrl}/api/rooms/${roomId}/admins`, {
         method: 'POST',
         headers: {
@@ -141,7 +141,7 @@ function AdminPanel({ roomId, onClose, isVisible }) {
   const demoteAdmin = async (username) => {
     if (window.confirm(`Are you sure you want to demote ${username} from admin?`)) {
       try {
-        const apiUrl = process.env.REACT_APP_API_URL || 'http://awsproject-backend-prod.eba-fphuu5yq.us-east-1.elasticbeanstalk.com';
+        const apiUrl = getApiUrl();
         const response = await fetch(`${apiUrl}/api/rooms/${roomId}/admins/${username}`, {
           method: 'DELETE',
           headers: {
@@ -166,7 +166,7 @@ function AdminPanel({ roomId, onClose, isVisible }) {
   // Load user permissions
   const loadPermissions = async () => {
     try {
-      const apiUrl = process.env.REACT_APP_API_URL || 'http://awsproject-backend-prod.eba-fphuu5yq.us-east-1.elasticbeanstalk.com';
+      const apiUrl = getApiUrl();
       const response = await fetch(`${apiUrl}/api/rooms/${roomId}/permissions/${getUserIdentifier()}`);
       
       if (response.ok) {
@@ -186,7 +186,7 @@ function AdminPanel({ roomId, onClose, isVisible }) {
     }
 
     try {
-      const apiUrl = process.env.REACT_APP_API_URL || 'http://awsproject-backend-prod.eba-fphuu5yq.us-east-1.elasticbeanstalk.com';
+      const apiUrl = getApiUrl();
       const response = await fetch(`${apiUrl}/api/rooms/${roomId}/name`, {
         method: 'PATCH',
         headers: {
@@ -217,7 +217,7 @@ function AdminPanel({ roomId, onClose, isVisible }) {
   // Update room color
   const updateRoomColor = async (color) => {
     try {
-      const apiUrl = process.env.REACT_APP_API_URL || 'http://awsproject-backend-prod.eba-fphuu5yq.us-east-1.elasticbeanstalk.com';
+      const apiUrl = getApiUrl();
       const response = await fetch(`${apiUrl}/api/rooms/${roomId}/color`, {
         method: 'PATCH',
         headers: {
@@ -246,7 +246,7 @@ function AdminPanel({ roomId, onClose, isVisible }) {
   // Update room settings
   const updateRoomSettings = async (newSettings) => {
     try {
-      const apiUrl = process.env.REACT_APP_API_URL || 'http://awsproject-backend-prod.eba-fphuu5yq.us-east-1.elasticbeanstalk.com';
+      const apiUrl = getApiUrl();
       const response = await fetch(`${apiUrl}/api/rooms/${roomId}/settings`, {
         method: 'PATCH',
         headers: {
@@ -280,7 +280,7 @@ function AdminPanel({ roomId, onClose, isVisible }) {
     }
 
     try {
-      const apiUrl = process.env.REACT_APP_API_URL || 'http://awsproject-backend-prod.eba-fphuu5yq.us-east-1.elasticbeanstalk.com';
+      const apiUrl = getApiUrl();
       
       const response = await fetch(`${apiUrl}/api/rooms/${roomId}/invite-admin`, {
         method: 'POST',

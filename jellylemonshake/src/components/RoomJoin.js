@@ -1,23 +1,16 @@
 import React, { useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useAuth } from './AuthContext';
+import { getApiUrl } from '../config';
 import '../styles/components/RoomJoin.css';
 
 function RoomJoin() {
   const navigate = useNavigate();
-  const { user, isAuthenticated } = useAuth();
+  const { user, loading: authLoading } = useAuth();
   const [roomId, setRoomId] = useState('');
   const [password, setPassword] = useState('');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
-
-  // Redirect to login if not authenticated
-  React.useEffect(() => {
-    if (!isAuthenticated) {
-      navigate('/login');
-      return;
-    }
-  }, [isAuthenticated, navigate]);
 
   const handleJoinRoom = async (e) => {
     e.preventDefault();
@@ -26,26 +19,31 @@ function RoomJoin() {
       return;
     }
 
+    if (!user) {
+      setError('Please wait for session to load, or go home and continue as guest');
+      return;
+    }
+
     setLoading(true);
     setError('');
 
     try {
-      const apiUrl = process.env.REACT_APP_API_URL || 'http://awsproject-backend-prod.eba-fphuu5yq.us-east-1.elasticbeanstalk.com';
+      const apiUrl = getApiUrl();
+      const username = user.email || user.username || 'Guest';
       const response = await fetch(`${apiUrl}/api/rooms/${roomId}/join`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
         },
         body: JSON.stringify({
-          username: user.email || user.username,
-          password: password || undefined
-        })
+          username,
+          password: password || undefined,
+        }),
       });
 
       const data = await response.json();
 
       if (response.ok) {
-        // Successfully joined room, navigate to it
         navigate(`/room/${roomId}`);
       } else {
         setError(data.error || 'Failed to join room');
@@ -57,8 +55,14 @@ function RoomJoin() {
     }
   };
 
-  if (!isAuthenticated) {
-    return null;
+  if (authLoading || !user) {
+    return (
+      <div className="room-join-container">
+        <div className="room-join-card">
+          <p>Loading...</p>
+        </div>
+      </div>
+    );
   }
 
   return (
@@ -71,7 +75,7 @@ function RoomJoin() {
 
         <form onSubmit={handleJoinRoom} className="room-join-form">
           {error && <div className="error-message">{error}</div>}
-          
+
           <div className="form-group">
             <label htmlFor="roomId">Room ID</label>
             <input
@@ -95,21 +99,14 @@ function RoomJoin() {
             />
           </div>
 
-          <button 
-            type="submit" 
-            className="join-button"
-            disabled={loading}
-          >
+          <button type="submit" className="join-button" disabled={loading}>
             {loading ? 'Joining...' : 'Join Room'}
           </button>
         </form>
 
         <div className="room-join-footer">
           <p>Don't have a room ID?</p>
-          <button 
-            className="create-room-button"
-            onClick={() => navigate('/')}
-          >
+          <button type="button" className="create-room-button" onClick={() => navigate('/')}>
             Create a New Room
           </button>
         </div>
